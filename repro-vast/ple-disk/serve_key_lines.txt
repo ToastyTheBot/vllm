@@ -1,0 +1,8 @@
+/workspace/serve.log.mtp3:(EngineCore pid=37678) INFO 08-31 19:38:00 [__init__.py:874] Using MarlinMxfp8LinearKernel for MXFP8 GEMM
+/workspace/serve.log.mtp3:(EngineCore pid=37678) INFO 08-31 19:38:05 [ple_mmap.py:1749] PLE mmap: layer 1 attached (nvfp4), 128 shards, 320001536 rows x 80 B (23.84 GiB on disk), 32 workers
+/workspace/serve.log.mtp3:(EngineCore pid=37678) INFO 08-31 19:39:27 [model_runner.py:404] Model loading took 73.07 GiB memory and 86.731631 seconds
+/workspace/serve.log.mtp3:(EngineCore pid=37678) INFO 08-31 19:41:17 [kv_cache_utils.py:2020] GPU KV cache size: 454,594 tokens, Maximum concurrency for 180,224 tokens per request: 2.52x
+/workspace/serve.log:(EngineCore pid=81915) INFO 08-31 22:33:12 [__init__.py:874] Using EmulationMxfp8LinearKernel for MXFP8 GEMM
+/workspace/serve.log:(EngineCore pid=81915) INFO 08-31 22:33:17 [ple_mmap.py:1749] PLE mmap: layer 1 attached (nvfp4), 128 shards, 320001536 rows x 80 B (23.84 GiB on disk), 32 workers
+/workspace/serve.log:(EngineCore pid=81915) INFO 08-31 22:34:23 [model_runner.py:404] Model loading took 74.66 GiB memory and 70.784218 seconds
+/workspace/serve.log:(EngineCore pid=81915) INFO 08-31 22:34:37 [kv_cache_utils.py:2020] GPU KV cache size: 497,069 tokens, Maximum concurrency for 180,224 tokens per request: 2.76x
