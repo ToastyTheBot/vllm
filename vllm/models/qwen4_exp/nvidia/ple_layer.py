@@ -523,6 +523,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 )
                 loaded.add(name)
                 continue
+            if isinstance(embedding, ple_mmap.MmapNgramEmbedding) and (
+                (name.startswith(shard_prefix) and name.endswith(".weight_scale"))
+                or name == "ngram_embedding.weight_scale_2"
+            ):
+                # NVFP4 tables carry per-row group-16 block scales sharded
+                # alongside the weights, plus one global scale. All of it is
+                # served from disk by the mmap tables, so the streamed copies
+                # are dropped here exactly like the weight shards above.
+                embedding.weights_streamed = True
+                loaded.add(name)
+                continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
@@ -542,13 +553,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     0,
                     min(shard_size, embedding.org_vocab_size - checkpoint_start),
                 )
-                expected_shape = (expected_rows, embedding.embedding_dim)
-                if tuple(loaded_weight.shape) != expected_shape:
-                    raise ValueError(
-                        f"Shape mismatch for PLE embedding shard {shard_index}: "
-                        f"expected {expected_shape}, got "
-                        f"{tuple(loaded_weight.shape)}"
-                    )
                 if isinstance(embedding, ple_mmap.MmapNgramEmbedding):
                     # Served from disk via mmap; the loader still streams this
                     # shard transiently, but it is never retained.
@@ -557,9 +561,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     # load_weights at all — build_tables must attach a real
                     # table before any forward, or the placeholder raises
                     # instead of silently serving fp8 zeros.
+                    #
+                    # The width check below is deliberately skipped rather than
+                    # run first: it assumes one element per column, which is
+                    # false for a packed NVFP4 table (2 values/byte, so the
+                    # shard is embedding_dim/2 wide). ple_mmap's own discovery
+                    # and _validate_layer_shards are authoritative for these
+                    # shards, and check width against the actual on-disk dtype.
                     embedding.weights_streamed = True
                     loaded.add("ngram_embedding.weight")
                     continue
+                expected_shape = (expected_rows, embedding.embedding_dim)
+                if tuple(loaded_weight.shape) != expected_shape:
+                    raise ValueError(
+                        f"Shape mismatch for PLE embedding shard {shard_index}: "
+                        f"expected {expected_shape}, got "
+                        f"{tuple(loaded_weight.shape)}"
+                    )
                 embedding.weight.weight_loader(
                     embedding.weight,
                     loaded_weight,
