@@ -325,6 +325,13 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_PLE_MMAP: bool = False
+    VLLM_PLE_MMAP_WORKERS: int = 32
+    VLLM_PLE_MMAP_CHUNK: int = 2048
+    VLLM_PLE_MMAP_PREWARM: bool = False
+    VLLM_PLE_MMAP_READAHEAD: int = 0
+    VLLM_PLE_MMAP_PINNED: bool = False
+    VLLM_PLE_MMAP_SERIAL: int = 0
     VLLM_ENABLE_HPC_OPS: bool = False
 
 
@@ -2203,6 +2210,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     fused into gated_mla_gemm; elementwise gating only.
     # Each op additionally checks its own shape / dtype constraints and falls
     # back to the eager path when they do not hold.
+    # Serve the Qwen4Exp PLE n-gram table from NVMe via mmap instead of
+    # keeping it GPU/host-resident. See vllm/models/qwen4_exp/nvidia/ple_mmap.py.
+    "VLLM_PLE_MMAP": lambda: bool(int(os.getenv("VLLM_PLE_MMAP", "0"))),
+    # Gather thread-pool size for the PLE mmap path.
+    "VLLM_PLE_MMAP_WORKERS": lambda: int(os.getenv("VLLM_PLE_MMAP_WORKERS", "32")),
+    # Rows per PLE mmap gather task.
+    "VLLM_PLE_MMAP_CHUNK": lambda: int(os.getenv("VLLM_PLE_MMAP_CHUNK", "2048")),
+    # If set, stream the PLE table once at load to warm the page cache
+    # (bounded by available memory).
+    "VLLM_PLE_MMAP_PREWARM": lambda: bool(int(os.getenv("VLLM_PLE_MMAP_PREWARM", "0"))),
+    # Max coalesced file ranges a PLE mmap gather may hand to
+    # posix_fadvise(WILLNEED) before copying; 0 disables the readahead
+    # pre-pass, and a gather needing more ranges than this skips it.
+    "VLLM_PLE_MMAP_READAHEAD": lambda: int(os.getenv("VLLM_PLE_MMAP_READAHEAD", "0")),
+    # Stage each PLE mmap forward's gathered rows through a per-call pinned
+    # host buffer before the H2D copy, instead of copying straight out of
+    # gather()'s pageable numpy array.
+    "VLLM_PLE_MMAP_PINNED": lambda: bool(int(os.getenv("VLLM_PLE_MMAP_PINNED", "0"))),
+    # Rows threshold at or under which a PLE mmap gather runs its tasks
+    # inline on the calling thread instead of through the worker pool; 0
+    # (default) disables this and always dispatches through the pool.
+    "VLLM_PLE_MMAP_SERIAL": lambda: int(os.getenv("VLLM_PLE_MMAP_SERIAL", "0")),
     "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
 }
 
@@ -2373,6 +2402,15 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        # PLE mmap runtime tuning: affects only the CPU/host body of a
+        # split-out op, never the compiled graph. VLLM_PLE_MMAP itself stays
+        # a factor since it changes which op the graph splits around.
+        "VLLM_PLE_MMAP_WORKERS",
+        "VLLM_PLE_MMAP_CHUNK",
+        "VLLM_PLE_MMAP_PREWARM",
+        "VLLM_PLE_MMAP_READAHEAD",
+        "VLLM_PLE_MMAP_PINNED",
+        "VLLM_PLE_MMAP_SERIAL",
     }
 
     from vllm.config.utils import normalize_value

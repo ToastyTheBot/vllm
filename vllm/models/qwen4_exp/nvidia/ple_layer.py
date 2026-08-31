@@ -3,6 +3,7 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 from collections.abc import Iterable, Sequence
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +44,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 
 from ..common.ple import PLEVocabParallelEmbedding
+from . import ple_mmap
 from .ops.ple import ple_conv, ple_gate, ple_ngram_ids
 
 
@@ -311,15 +313,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = PLEVocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim,
-            params_dtype=params_dtype,
-            padding_size=divisor,
-            prefix=f"{prefix}.ngram_embedding",
-            quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
-            ),
+        self.ngram_embedding: PLEVocabParallelEmbedding | ple_mmap.MmapNgramEmbedding
+        if ple_mmap.enabled():
+            vllm_config = get_current_vllm_config()
+            ple_mmap.check_cudagraph_safety(vllm_config.compilation_config)
+            ple_mmap.validate_shards_for(
+                vllm_config.model_config, layer_name, self.head_dim
+            )
+            self.ngram_embedding = ple_mmap.MmapNgramEmbedding(
+                padded_vocab_size, self.head_dim
+            )
+        else:
+            self.ngram_embedding = PLEVocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype=params_dtype,
+                padding_size=divisor,
+                prefix=f"{prefix}.ngram_embedding",
+                quant_method=_get_ple_embedding_quant_method(
+                    quant_config, f"{prefix}.ngram_embedding"
+                ),
         )
 
     @staticmethod
@@ -437,6 +450,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+            # The mmap gather is a blocking host round-trip (ids D2H, page-cache
+            # gather, rows H2D), so it must sit outside the compiled graph.
+            output = torch.empty(
+                (input_ids.shape[0], self.embedding_dim),
+                dtype=self.ngram_embedding.torch_dtype,
+                device=input_ids.device,
+            )
+            torch.ops.vllm.qwen4_exp_ple_mmap_forward(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                output,
+                self.layer_name,
+            )
+            return output
         # Keep num_reqs-dependent ID generation outside PIECEWISE CUDA graphs,
         # which dispatch only on the padded token count.
         # torch.compile requires the splitting op to write graph-owned storage.
@@ -464,6 +493,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
+        embedding = self.ngram_embedding
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
@@ -479,6 +509,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
                 loaded.add(name)
                 continue
+            if (
+                isinstance(embedding, ple_mmap.MmapNgramEmbedding)
+                and name == "ngram_embedding.weight_scale"
+            ):
+                # The placeholder has no registered weight_scale Parameter for
+                # AutoWeightsLoader to find generically; register it directly,
+                # on whatever device the module's other buffers already live.
+                ple_mmap.set_weight_scale(
+                    embedding,
+                    loaded_weight,
+                    cast(torch.Tensor, self.layer_multipliers).device,
+                )
+                loaded.add(name)
+                continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
@@ -490,7 +534,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"PLE embedding shard index {shard_index} exceeds "
                         f"split_ngram_parts={self.split_ngram_parts}"
                     )
-                embedding = self.ngram_embedding
                 shard_size = (
                     embedding.org_vocab_size + self.split_ngram_parts - 1
                 ) // self.split_ngram_parts
@@ -506,6 +549,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
+                if isinstance(embedding, ple_mmap.MmapNgramEmbedding):
+                    # Served from disk via mmap; the loader still streams this
+                    # shard transiently, but it is never retained.
+                    # weights_streamed distinguishes this real (non-dummy) load
+                    # from a --load-format dummy probe that never calls
+                    # load_weights at all — build_tables must attach a real
+                    # table before any forward, or the placeholder raises
+                    # instead of silently serving fp8 zeros.
+                    embedding.weights_streamed = True
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 embedding.weight.weight_loader(
                     embedding.weight,
                     loaded_weight,
@@ -608,7 +662,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         """Dequantize PLE lookup output."""
 
         if not is_fp8(embeddings):
-            return embeddings
+            # Unquantized (e.g. BF16) tables carry no scale to apply — just
+            # cast to the output dtype, same as the fp8 branch's final cast.
+            return embeddings.to(output_dtype)
         weight_scale = self._get_embedding_weight_scale()
         if weight_scale is None:
             raise RuntimeError("FP8 PLE embedding is missing its global scale")
