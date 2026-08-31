@@ -67,7 +67,7 @@ import os
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -123,6 +123,12 @@ _SHARD_RE = re.compile(
 _SCALE_RE = re.compile(
     r"layers\.(\d+)\.ple\.ple_embedding\.ngram_embedding\.weight_scale$"
 )
+_SHARD_SCALE_RE = re.compile(
+    r"layers\.(\d+)\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight_scale$"
+)
+_GLOBAL_SCALE_RE = re.compile(
+    r"layers\.(\d+)\.ple\.ple_embedding\.ngram_embedding\.weight_scale_2$"
+)
 _LAYER_IDX_RE = re.compile(r"\.layers\.(\d+)\.")
 
 
@@ -137,6 +143,15 @@ def _itemsize(dtype_str: str) -> int:
     if torch_dtype is None:
         raise ValueError(f"PLE mmap: unrecognized safetensors dtype {dtype_str!r}")
     return get_dtype_size(torch_dtype)
+
+
+NVFP4_BLOCK_SIZE = 16
+
+
+def is_nvfp4(layer_shards: "_LayerShards") -> bool:
+    """True when this layer's table is NVFP4: packed 2 values/byte with
+    per-row group-16 block scales sharded alongside the weights."""
+    return bool(layer_shards.scale_shards)
 
 
 def enabled() -> bool:
@@ -204,6 +219,14 @@ class _LayerShards:
     cols: int
     dtype_str: str
     scale_entry: tuple[str, int, int, str] | None  # (path, offset, nbytes, dtype)
+    # NVFP4 only. The table is packed 2 values/byte and carries per-ROW
+    # group-16 block scales laid out exactly like the weight shards, plus one
+    # fp32 global scale. Empty/None for the FP8 and BF16 tables #54129
+    # originally supported.
+    scale_shards: dict[int, tuple[str, int, int]] = field(default_factory=dict)
+    scale_cols: int | None = None
+    scale_dtype_str: str | None = None
+    global_scale_entry: tuple[str, int, int, str] | None = None
 
 
 @functools.cache
@@ -231,6 +254,10 @@ def discover_shards(model_path: str) -> dict[int, _LayerShards]:
     cols_by_layer: dict[int, int] = {}
     dtype_by_layer: dict[int, str] = {}
     scale_by_layer: dict[int, tuple[str, int, int, str]] = {}
+    scale_shards_by_layer: dict[int, dict[int, tuple[str, int, int]]] = {}
+    scale_cols_by_layer: dict[int, int] = {}
+    scale_dtype_by_layer: dict[int, str] = {}
+    global_scale_by_layer: dict[int, tuple[str, int, int, str]] = {}
 
     for path in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
         header, data_start = parse_safetensors_header(path)
@@ -272,6 +299,54 @@ def discover_shards(model_path: str) -> dict[int, _LayerShards]:
                     rows,
                 )
                 continue
+            shard_scale_match = _SHARD_SCALE_RE.search(name)
+            if shard_scale_match:
+                layer_idx = int(shard_scale_match.group(1))
+                shard_idx = int(shard_scale_match.group(2))
+                start, end = meta["data_offsets"]
+                try:
+                    rows, cols = meta["shape"]
+                except (KeyError, ValueError):
+                    raise ValueError(
+                        f"{path}: PLE block-scale shard {name!r} has an "
+                        f"unexpected shape {meta.get('shape')!r} (expected a "
+                        "2-element [rows, cols])"
+                    ) from None
+                dtype_str = meta["dtype"]
+                if end - start != rows * cols * _itemsize(dtype_str):
+                    raise ValueError(
+                        f"{path}: PLE block-scale shard {name!r} size does not "
+                        f"match its declared shape/dtype"
+                    )
+                prev_dtype = scale_dtype_by_layer.setdefault(layer_idx, dtype_str)
+                if prev_dtype != dtype_str:
+                    raise ValueError(
+                        f"PLE layer {layer_idx}: mixed block-scale dtypes "
+                        f"{prev_dtype!r} vs {dtype_str!r}"
+                    )
+                prev_cols = scale_cols_by_layer.setdefault(layer_idx, cols)
+                if prev_cols != cols:
+                    raise ValueError(
+                        f"PLE layer {layer_idx}: mixed block-scale widths "
+                        f"{prev_cols} vs {cols}"
+                    )
+                scale_shards_by_layer.setdefault(layer_idx, {})[shard_idx] = (
+                    path,
+                    data_start + start,
+                    rows,
+                )
+                continue
+            global_scale_match = _GLOBAL_SCALE_RE.search(name)
+            if global_scale_match:
+                layer_idx = int(global_scale_match.group(1))
+                start, end = meta["data_offsets"]
+                global_scale_by_layer[layer_idx] = (
+                    path,
+                    data_start + start,
+                    end - start,
+                    meta["dtype"],
+                )
+                continue
             scale_match = _SCALE_RE.search(name)
             if scale_match:
                 layer_idx = int(scale_match.group(1))
@@ -289,6 +364,10 @@ def discover_shards(model_path: str) -> dict[int, _LayerShards]:
             cols=cols_by_layer[layer_idx],
             dtype_str=dtype_by_layer[layer_idx],
             scale_entry=scale_by_layer.get(layer_idx),
+            scale_shards=scale_shards_by_layer.get(layer_idx, {}),
+            scale_cols=scale_cols_by_layer.get(layer_idx),
+            scale_dtype_str=scale_dtype_by_layer.get(layer_idx),
+            global_scale_entry=global_scale_by_layer.get(layer_idx),
         )
         for layer_idx, shards in per_layer.items()
     }
@@ -914,6 +993,11 @@ class MmapNgramEmbedding(nn.Module):
         self.embedding_dim = int(embedding_dim)
         self.torch_dtype: torch.dtype = torch.float8_e4m3fn
         self.table: MmapPleTable | None = None
+        # NVFP4 only: a second table over the per-row group-16 block scales,
+        # gathered with the same row ids, plus the fp32 global scale. Both
+        # stay None for FP8/BF16 tables.
+        self.scale_table: MmapPleTable | None = None
+        self.global_scale: torch.Tensor | None = None
         self.weight_scale_loaded = False
         self.weights_streamed = False
         # Snapshotted from VLLM_PLE_MMAP_PINNED AND torch.cuda.is_available()
@@ -949,6 +1033,8 @@ class MmapNgramEmbedding(nn.Module):
                 dtype=self.torch_dtype,
                 device=ids.device,
             )
+        if self.scale_table is not None:
+            return self._forward_nvfp4(ids, table, self.scale_table)
         sync_t = time.monotonic()
         ids_np = ids.detach().to("cpu", non_blocking=False).numpy().reshape(-1)
         # gather_t doubles as sync_t's end-of-window read: nothing runs
@@ -989,6 +1075,73 @@ class MmapNgramEmbedding(nn.Module):
         h2d_ms = (time.monotonic() - h2d_t) * 1000.0
         self._record_forward_timing(
             ids_np.size, sync_ms, gather_ms, h2d_ms, pinned=pinned_engaged
+        )
+        return out.reshape(*ids.shape, self.embedding_dim)
+
+    def _forward_nvfp4(
+        self,
+        ids: torch.Tensor,
+        table: MmapPleTable,
+        scale_table: MmapPleTable,
+    ) -> torch.Tensor:
+        """Gather packed NVFP4 rows and their block scales, then dequantize.
+
+        Two gathers over the same row ids: ``table`` yields packed nibbles
+        (``embedding_dim / 2`` bytes per row) and ``scale_table`` the
+        matching group-16 block scales (``embedding_dim / 16`` bytes). Both
+        are copied to the device before ``dequantize_to_dtype`` unpacks and
+        rescales them, so no NVFP4 arithmetic happens on the host.
+        """
+        from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (  # noqa: E501
+            dequantize_to_dtype,
+        )
+
+        packed_bytes = self.embedding_dim // 2
+        scale_bytes = self.embedding_dim // NVFP4_BLOCK_SIZE
+        if table.row_bytes != packed_bytes:
+            raise ValueError(
+                f"PLE mmap: NVFP4 table row_bytes={table.row_bytes} does not "
+                f"match embedding_dim={self.embedding_dim} / 2"
+            )
+        if scale_table.row_bytes != scale_bytes:
+            raise ValueError(
+                f"PLE mmap: NVFP4 block-scale row_bytes="
+                f"{scale_table.row_bytes} does not match embedding_dim="
+                f"{self.embedding_dim} / {NVFP4_BLOCK_SIZE}"
+            )
+        assert self.global_scale is not None
+
+        sync_t = time.monotonic()
+        ids_np = ids.detach().to("cpu", non_blocking=False).numpy().reshape(-1)
+        gather_t = time.monotonic()
+        sync_ms = (gather_t - sync_t) * 1000.0
+        rows = table.gather(ids_np)
+        scale_rows = scale_table.gather(ids_np)
+        gather_ms = (time.monotonic() - gather_t) * 1000.0
+
+        h2d_t = time.monotonic()
+        packed = torch.from_numpy(rows).to(ids.device, non_blocking=True)
+        block_scales = (
+            torch.from_numpy(scale_rows)
+            .view(torch.float8_e4m3fn)
+            .to(ids.device, non_blocking=True)
+        )
+        if self.global_scale.device != ids.device:
+            self.global_scale = self.global_scale.to(ids.device)
+        # ModelOpt stores weight_scale_2 as amax/2688 and dequantize_to_dtype
+        # consumes it un-reciprocated (see ModelOptNvFp4LinearMethod), so the
+        # checkpoint value is passed straight through.
+        out = dequantize_to_dtype(
+            packed,
+            block_scales,
+            self.global_scale,
+            torch.bfloat16,
+            block_size=NVFP4_BLOCK_SIZE,
+            swizzle=False,
+        )
+        h2d_ms = (time.monotonic() - h2d_t) * 1000.0
+        self._record_forward_timing(
+            ids_np.size, sync_ms, gather_ms, h2d_ms, pinned=False
         )
         return out.reshape(*ids.shape, self.embedding_dim)
 
@@ -1198,6 +1351,48 @@ def _validate_layer_shards(
         The layer's validated ``scale_entry``, or ``None`` when the
         discovered dtype's descriptor has ``requires_scale=False``.
     """
+    if is_nvfp4(layer_shards):
+        # Packed 4-bit: two values per byte, so the shard is half as wide in
+        # BYTES as the row is in ELEMENTS. #54129's dtype table assumes one
+        # element per byte (FP8) or two bytes per element (BF16); neither
+        # describes this, hence the separate branch.
+        if layer_shards.dtype_str != "U8":
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} has per-shard block scales "
+                f"(NVFP4) but shard dtype {layer_shards.dtype_str!r}; "
+                "packed NVFP4 shards must be U8"
+            )
+        if layer_shards.cols * 2 != head_dim:
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} NVFP4 shard width "
+                f"{layer_shards.cols} B != head_dim {head_dim} / 2"
+            )
+        if layer_shards.scale_cols != head_dim // NVFP4_BLOCK_SIZE:
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} NVFP4 block-scale width "
+                f"{layer_shards.scale_cols} != head_dim {head_dim} / "
+                f"{NVFP4_BLOCK_SIZE}"
+            )
+        if layer_shards.scale_dtype_str != "F8_E4M3":
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} NVFP4 block scales have dtype "
+                f"{layer_shards.scale_dtype_str!r}, expected 'F8_E4M3'"
+            )
+        missing_scale = sorted(
+            set(layer_shards.shards) - set(layer_shards.scale_shards)
+        )
+        if missing_scale:
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} NVFP4 weight shard(s) "
+                f"{missing_scale} have no matching block-scale shard under "
+                f"{model_path}"
+            )
+        if layer_shards.global_scale_entry is None:
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} is NVFP4 but has no "
+                f"ngram_embedding.weight_scale_2 under {model_path}"
+            )
+        return None
     if layer_shards.cols != head_dim:
         raise RuntimeError(
             f"PLE mmap: layer {layer_idx} shard width {layer_shards.cols} "
@@ -1381,8 +1576,12 @@ def _attach_table(
     scale_entry = _validate_layer_shards(
         layer_shards, embedding.embedding_dim, layer_idx, model_path
     )
-    desc = _PLE_DTYPES[layer_shards.dtype_str]
-    if desc.requires_scale:
+    nvfp4 = is_nvfp4(layer_shards)
+    # NVFP4's scales are per-row and sharded, not a single streamed scalar,
+    # so the streamed-vs-header cross-check below does not apply; the global
+    # scale is read straight from the header instead.
+    desc = _PLE_DTYPES["BF16"] if nvfp4 else _PLE_DTYPES[layer_shards.dtype_str]
+    if desc.requires_scale and not nvfp4:
         assert scale_entry is not None
         if not embedding.weight_scale_loaded:
             if embedding.weights_streamed:
@@ -1468,6 +1667,7 @@ def _attach_table(
 
     row_bytes = layer_shards.cols * _itemsize(layer_shards.dtype_str)
     table: MmapPleTable | None = None
+    scale_table: MmapPleTable | None = None
     try:
         table = MmapPleTable(
             layer_shards.shards,
@@ -1480,7 +1680,33 @@ def _attach_table(
             readahead=envs.VLLM_PLE_MMAP_READAHEAD,
             serial=envs.VLLM_PLE_MMAP_SERIAL,
         )
-        embedding.torch_dtype = table.torch_dtype
+        if nvfp4:
+            # The block scales are laid out exactly like the weight shards —
+            # same 128-way row split, same row order — so they ride the same
+            # gather machinery (coalescing, readahead, thread pool) as a
+            # second table keyed by the same row ids.
+            assert layer_shards.scale_cols is not None
+            scale_table = MmapPleTable(
+                layer_shards.scale_shards,
+                shard_size,
+                layer_shards.scale_cols * _itemsize("F8_E4M3"),
+                torch.float8_e4m3fn,
+                workers=envs.VLLM_PLE_MMAP_WORKERS,
+                chunk=envs.VLLM_PLE_MMAP_CHUNK,
+                model_path=model_path,
+                readahead=envs.VLLM_PLE_MMAP_READAHEAD,
+                serial=envs.VLLM_PLE_MMAP_SERIAL,
+            )
+            assert layer_shards.global_scale_entry is not None
+            embedding.global_scale = _read_scale(
+                layer_shards.global_scale_entry
+            ).reshape(()).to(torch.float32)
+            embedding.scale_table = scale_table
+            # Dequantized output is bf16, so Qwen4ExpPLELayer's is_fp8() gate
+            # correctly declines to apply a second scale to it.
+            embedding.torch_dtype = torch.bfloat16
+        else:
+            embedding.torch_dtype = table.torch_dtype
         # Snapshotted once here, not read inside forward: forward currently
         # reads no envs at all, and vllm's envs.__getattr__ re-runs
         # os.getenv on every access. Combined with torch.cuda.is_available()
@@ -1514,13 +1740,17 @@ def _attach_table(
         # Nothing between construction and the attach above may raise and
         # leak the table's memmaps, readahead fds, or thread pool — close
         # whatever construction already opened before this propagates.
+        if scale_table is not None:
+            scale_table.close()
+            embedding.scale_table = None
         if table is not None:
             table.close()
         raise
     logger.info(
-        "PLE mmap: layer %d attached, %d shards, %d rows x %d B "
+        "PLE mmap: layer %d attached (%s), %d shards, %d rows x %d B "
         "(%.2f GiB on disk), %d workers",
         layer_idx,
+        "nvfp4" if nvfp4 else layer_shards.dtype_str.lower(),
         len(layer_shards.shards),
         table.rows_total,
         row_bytes,
