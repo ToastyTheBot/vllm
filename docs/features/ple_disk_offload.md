@@ -82,10 +82,23 @@ Model loading took 73.07 GiB memory and 75.8 seconds
 GPU KV cache size: 454,594 tokens
 ```
 
-Host RSS for the whole engine settles around **3.7–5.8 GiB** — the table itself
-is never counted against RSS, only against evictable page cache. The stock path
-cannot serve this checkpoint on one 96 GB GPU at all: 98.53 GiB of weights does
-not fit in 96 GB of VRAM.
+Host memory splits into two very different parts, and they should be read
+separately:
+
+| | |
+|---|---|
+| anonymous (non-evictable) | **~3.1 GiB** |
+| file-backed, clean, evictable (the mmap'd table) | grows toward the table size |
+
+Only the anonymous figure is a hard requirement. The file-backed portion is
+mmap-backed page cache the kernel reclaims under pressure, so it expands to
+whatever the host can spare — on a 1 TB host it grows to hold nearly the whole
+23.84 GiB table, and on a small host it simply holds less and serves more
+gathers from NVMe. Measure `Pss_Anon` in `/proc/<pid>/smaps_rollup`, not `Rss`,
+when sizing a deployment.
+
+The stock path cannot serve this checkpoint on one 96 GB GPU at all: 98.53 GiB
+of weights does not fit in 96 GB of VRAM.
 
 ## Deployment notes
 
@@ -93,6 +106,14 @@ not fit in 96 GB of VRAM.
   than the table. Otherwise the load's own multi-GiB checkpoint streaming
   passes through the global page cache and evicts the table it is about to
   serve. A container memory cap makes reclaim cgroup-local.
+- **Prefix caching works, but needs the hybrid-mamba seeding fix.** Before that
+  fix, enabling prefix caching on this model produced degenerate repetition and
+  then a CUDA illegal memory access (upstream #54173), because
+  `MambaHybridModelState.add_request` seeded the mamba state column with
+  `cache_config.block_size` — which `EngineCore` rewrites to the *smallest* KV
+  group's block size on a hybrid model (4 here, versus a mamba block size of
+  1568). With the fix in this branch, the 30-run estonia long-context suite
+  scores 30/30 with prefix caching enabled.
 - **KV cache dtype must stay bf16.** Upstream's Qwen4Exp QSA kernel raises
   `Qwen4Exp QSA requires a BF16 main KV cache` for any other value
   (`vllm/models/qwen4_exp/nvidia/qsa.py`), so `--kv-cache-dtype fp8` is not

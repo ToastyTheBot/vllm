@@ -1,0 +1,11 @@
+Warning: Permanently added '[154.59.156.16]:52922' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+engine RSS/PSS:
+Rss:            30037424 kB
+Pss:            29839161 kB
+all vllm RSS:
+  30.90 GiB
+(EngineCore pid=38978) INFO 09-01 19:59:21 [ple_mmap.py:1749] PLE mmap: layer 1 attached (nvfp4), 128 shards, 320001536 rows x 80 B (23.84 GiB on disk), 32 workers
+(EngineCore pid=38978) INFO 09-01 20:00:40 [model_runner.py:404] Model loading took 73.07 GiB memory and 83.257126 seconds
+(EngineCore pid=38978) INFO 09-01 20:02:32 [kv_cache_utils.py:2020] GPU KV cache size: 454,594 tokens, Maximum concurrency for 180,224 tokens per request: 2.52x

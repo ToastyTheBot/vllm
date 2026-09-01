@@ -16,5 +16,6 @@ exec /workspace/vllmenv/bin/vllm serve /workspace/model \
   --max-num-seqs 16 \
   --gpu-memory-utilization 0.95 \
   --enable-prefix-caching \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
   -cc.cudagraph_mode=PIECEWISE \
   --port 8000
