@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next-NVFP4 on one RTX PRO 6000 96 GB, engrams on disk
 
-Session 2026-09-01. Hardware: vast.ai instance 49421402, machine 56397 (Texas),
+Sessions 2026-09-01 / 2026-09-02. Hardware: vast.ai instance 49421402, machine 56397 (Texas),
 1x RTX PRO 6000 Blackwell Server Edition 96 GB (sm_120), driver 590.48.01,
 256 cores, 1 TB host RAM, 8.7 GB/s NVMe. ~7.5 h, ~$13.
 
@@ -23,11 +23,19 @@ GPU KV cache size: 454,594 tokens
 | engram table, served from NVMe | 23.84 GiB |
 | backbone on GPU | 71.65 GiB (73.07 with MTP) |
 | checkpoint total | 98.53 GiB — **does not fit in 96 GB VRAM** without this |
-| engine host RSS | 3.67–3.92 GiB (PSS 3.47–3.72) |
-| all vLLM processes RSS | 5.77 GiB |
+| engine anonymous memory (non-evictable) | **3.07 GiB** |
+| engine file-backed RSS (evictable page cache) | 25.29 GiB, of which 24.79 GiB is the safetensors mmap |
+| engine total RSS | 28.65 GiB |
 
-Host RSS is far below the 28 GB target. The table is never charged to RSS,
-only to evictable page cache.
+**Read these two numbers separately.** The hard requirement is the ~3.1 GiB of
+anonymous memory. The file-backed portion is clean, mmap-backed page cache that
+the kernel reclaims under pressure -- it grew to hold nearly the whole 23.84 GiB
+table only because this box has 1 TB of RAM. On a 28 GB host the kernel simply
+keeps fewer table pages resident and serves more gathers from NVMe.
+
+An earlier revision of this document quoted 3.67-3.92 GiB RSS. That was measured
+shortly after startup, before the page cache warmed, and understated steady-state
+RSS; the anon/file split above is the accurate picture.
 
 Correctness of the offload path is established two ways:
 
@@ -39,67 +47,113 @@ Correctness of the offload path is established two ways:
    terminates cleanly — `finish=stop`, 2,267 completion tokens, final line
    *"...V-441 corresponds to Mirel Instrument, headquartered in Estonia."*
 
-## What does not work
+## The long-context crash: root-caused and fixed
 
-### estonia scored test — FAILS the 29/30 bar
+### Symptom
 
-| config | result |
+With prefix caching enabled, long-context runs produced degenerate repetition
+(`'ductductduct...'`) and then a `CUDA error: an illegal memory access was
+encountered`, killing the engine. Reported upstream as **#54173** with
+`--no-enable-prefix-caching` as the known workaround.
+
+### Root cause
+
+`vllm/v1/worker/gpu/model_states/mamba_hybrid.py`, `add_request`, seeded the
+mamba running-state column as:
+
+```python
+(new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+```
+
+`cache_config.block_size` is **not** the mamba group's block size at runtime.
+`EngineCore` rewrites it to `min(g.kv_cache_spec.block_size for g in
+kv_cache_groups)` once the KV cache config is known
+(`vllm/v1/engine/core.py:336`), so on a hybrid model it becomes the *smallest*
+group's block size. On Qwen3.8-Flash-Next that is the PLE short-conv group's
+**4**, against a mamba block size of **1568** — a 392x overshoot.
+
+That column indexes the mamba group's block table. Overshooting walks off the
+row, reads a garbage block id, multiplies it by the state stride, and faults
+inside `precopy_mamba_align_fused_kernel`.
+
+### Evidence
+
+A temporary host-side probe on the pre-copy launch caught it directly:
+
+```
+MAMBA-PRECOPY-PROBE: bt_width=42 num_reqs=3
+src_col=[7, 6, 2743]  dst_col=[7, 7, 7]  bad_src=[False, False, True]
+```
+
+`2743 / 7 = 391.86`, i.e. exactly `mamba_block_size / cache_config.block_size =
+1568 / 4`. A second capture gave `2351 / 6 = 391.83` — the same constant ratio,
+which is what identified the divisor.
+
+`num_computed_tokens == 0` yields `-1` for any positive divisor, so a fresh
+request never copies. That is precisely why **only prefix-cache hits crashed**,
+and why toggling prefix caching appeared to fix it.
+
+### Attribution
+
+The traceback initially pointed into `ple_mmap._forward_nvfp4`, because that
+function's `ids.detach().to("cpu")` is the first synchronizing point in the
+whole forward, so any earlier async fault surfaced there. Forcing an explicit
+`torch.cuda.synchronize()` ahead of it moved the fault to
+`vllm/compilation/cuda_graph.py`, and `--enforce-eager` plus
+`CUDA_LAUNCH_BLOCKING=1` then named the real site:
+`mamba_hybrid.py:preprocess_state` -> `mamba_utils.py:run_fused_precopy`.
+
+### Fix
+
+Read the mamba spec's block size, falling back to
+`cache_config.mamba_block_size` for the window before the spec is resolved
+(`add_request` can run before the first `preprocess_state`), and refuse to fall
+back to `cache_config.block_size`, which silently restores the bug. This is the
+same defect class as **#53142**, fixed in `mamba_utils.py`'s V1 path but never
+in this V2 align path.
+
+### Verification
+
+| check | result |
 |---|---|
-| Marlin MXFP8, MTP 3, c=6 | **12/30 correct** (`estonia_mtp3.json`) |
-| Emulation MXFP8, no MTP, c=6 | engine died mid-run (`estonia_emu.json`) |
-| Emulation MXFP8, no MTP, c=2 | engine died mid-run (`estonia_c2.json`) |
+| 8 rounds x 3 concurrent shared-prefix requests, up to 125,328 prompt tokens | **0 IMAs** (previously crashed in round 0, every time) |
+| estonia, 30 runs, c=6, **prefix caching ON** | **30/30 correct**, 0 errors, tokens p50/p90/max 2711/3679/5033 |
+| estonia, 30 runs, c=6, **prefix caching ON + MTP 3** | **30/30 correct**, 0 errors, mean acceptance 3.00 |
+| lavd (context consistency), 30 runs, c=6, prefix caching ON | **29/30**, 0 errors |
+| estonia, 30 runs, c=3, prefix caching off | 30/30 correct (pre-fix control) |
 
-Neither failure is in the engram path.
+### Withdrawn: the Marlin MXFP8 attribution
 
-### 1. Marlin MXFP8 is numerically wrong for this model
+An earlier revision of this document claimed `MarlinMxfp8LinearKernel` was
+numerically wrong for this model. **That was wrong and is withdrawn.** The
+comparison behind it changed three variables at once (kernel, concurrency, and
+prefix-cache reuse); the kernel was simply the one changed most recently. The
+30/30 run above uses Marlin, with prefix caching on. Marlin is fine.
 
-flashinfer's cutlass `mm_mxfp8` rejects this model's projection shapes on
-sm120 (`Problem size is not supported for mm_mxfp8`), so kernel selection falls
-through to `MarlinMxfp8LinearKernel`. Under Marlin, 18 of 30 estonia runs
-produced **degenerate repetition** — `'ductductductduct...'`, `'名单'` —
-looping to the 40,000-token cap. Correct runs finished in ~2,955 tokens
-(p50 2955, p90/max 40000).
+What remains true: flashinfer's cutlass `mm_mxfp8` genuinely cannot serve this
+model's projection shapes on sm120 (`Problem size is not supported for
+mm_mxfp8`), so it must be disabled and selection falls through to Marlin.
 
-Swapping to `EmulationMxfp8LinearKernel` (via
-`VLLM_DISABLED_KERNELS=FlashInferCutlassMxfp8LinearKernel,MarlinMxfp8LinearKernel`)
-makes the same prompt answer correctly in 2,267 tokens. **Marlin MXFP8 is
-producing wrong results here and should be treated as unusable for this model.**
+## Other findings
 
-### 2. CUDA illegal memory access at long context — UNRESOLVED
+### MTP 3 zero-acceptance -- also caused by the same bug, now fixed
 
-`CUDA error: an illegal memory access was encountered`, async, no useful
-traceback. Reproduced:
+Before the fix, MTP 3 reported `Mean acceptance length: 1.00, Accepted: 0
+tokens`, sustained: it drafted at ~380 tok/s and nothing was ever accepted.
+That was attributed here to the downstream fork's `4c1f7b2c3` *"fix(mtp):
+preserve position-zero embeddings (#539)"*. **That attribution is withdrawn.**
 
-- with MTP on **and** with MTP off → not MTP
-- with Marlin **and** with Emulation → not the MXFP8 kernel
-- at concurrency 6 **and** at concurrency 2 → not a specific concurrency level
-- **not** on a single sequential 136k request, which completes cleanly
+With the mamba seeding fix, MTP 3 reports `Mean acceptance length: 3.00-3.13`.
+The corrupted mamba state was making every draft mismatch the target, so zero
+acceptance was a second symptom of the same defect.
 
-So: long context plus more than one in-flight request. The engram gather is
-CPU/numpy and byte-exact, so it is not the source. Prime remaining suspect is
-upstream's Qwen4Exp QSA sparse-attention/indexer path at long context.
+### fp8 KV cache is unavailable
 
-Next step would be the standard IMA hunt: `--enforce-eager` plus
-`CUDA_LAUNCH_BLOCKING=1` to name the kernel (CLB alone is masked inside
-cudagraph replay), then instrument the suspect Triton kernel in place.
-
-### 3. MTP 3 acceptance is exactly 0
-
-`Mean acceptance length: 1.00, Drafted throughput: ~380 tokens/s, Accepted: 0
-tokens`, sustained for the whole run. MTP drafts and nothing is ever accepted —
-pure overhead, no speedup. Correctness is unaffected (rejected drafts are
-discarded). Likely the same defect fixed downstream by
-`local-inference-lab/vllm` commit `4c1f7b2c3` *"fix(mtp): preserve
-position-zero embeddings (#539)"*.
-
-### 4. fp8 KV cache is unavailable
-
-`vllm/models/qwen4_exp/nvidia/qsa.py:114` raises
-`Qwen4Exp QSA requires a BF16 main KV cache` for any `kv_cache_dtype` other
-than `auto`/`bfloat16`. Blanket refusal, not a knob — the sparse-attention
-kernel has no fp8 path. The downstream fork has this
-(`701985284 "Support FP8 KV cache for Qwen3.8 Flash Next"`) but via its b12x
-QSA implementation, which upstream does not have.
+`vllm/models/qwen4_exp/nvidia/qsa.py:114` raises `Qwen4Exp QSA requires a BF16
+main KV cache` for any `kv_cache_dtype` other than `auto`/`bfloat16`. Blanket
+refusal, not a knob -- the sparse-attention kernel has no fp8 path. The
+downstream fork has it (`701985284`) but via its b12x QSA implementation, which
+upstream does not have.
 
 ## Performance notes
 
