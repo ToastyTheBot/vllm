@@ -111,7 +111,12 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.img.outputs.name }}:sha-${{ github.sha }}
         run: |
-          docker run --rm --entrypoint /opt/venv/bin/python "$IMAGE_REF" - <<'PYEOF'
+          # -i is load-bearing: without it docker closes the container's
+          # stdin, `python -` reads EOF, executes nothing and exits 0 -- a
+          # smoke test that silently cannot fail. The sentinel grep below is
+          # the backstop for that whole class of mistake.
+          out=$(docker run --rm -i --entrypoint /opt/venv/bin/python \
+                  "$IMAGE_REF" - <<'PYEOF'
           import torch
           import vllm.envs as envs
           from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
@@ -138,7 +143,14 @@ jobs:
               "mamba align block-size fix missing"
           )
           print("image carries: PLE mmap + NVFP4, fp8 KV on QSA, mamba fix")
+          print("IMAGE_CHECKS_PASSED")
           PYEOF
+          )
+          echo "$out"
+          grep -q "IMAGE_CHECKS_PASSED" <<<"$out" || {
+            echo "::error::smoke test produced no sentinel -- it did not run"
+            exit 1
+          }
 
       - name: Summary
         if: always()
