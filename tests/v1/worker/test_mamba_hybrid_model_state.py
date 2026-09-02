@@ -94,3 +94,120 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+# --------------------------------------------------------------------------- #
+# Regression tests for the align-mode state-column seeding.
+#
+# MambaHybridModelState.add_request used to seed the running state column with
+# cache_config.block_size. EngineCore rewrites that field to
+# min(g.kv_cache_spec.block_size for g in kv_cache_groups) once the KV cache
+# config is known, so on a hybrid model it becomes the SMALLEST group's block
+# size, not the mamba group's. On Qwen3.8-Flash-Next that is the PLE
+# short-conv group's 4 against a mamba block size of 1568 -- a 392x overshoot
+# that walks off the mamba block table, reads a garbage block id, and faults in
+# precopy_mamba_align_fused_kernel.
+#
+# num_computed_tokens == 0 yields -1 for any positive divisor, which is why
+# only prefix-cache hits ever crashed -- so the seeding tests below use a
+# non-zero num_computed_tokens on purpose.
+# --------------------------------------------------------------------------- #
+
+# Realistic values from the failure: mamba block 1568, and a cache_config
+# block_size of 4 contributed by a co-resident short-conv group.
+_MAMBA_BLOCK_SIZE = 1568
+_SMALLEST_GROUP_BLOCK_SIZE = 4
+
+
+def _align_state(*, mamba_spec_block_size, mamba_block_size, block_size):
+    """A bare align-mode state with only what the seeding path touches."""
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state.cache_config = SimpleNamespace(
+        block_size=block_size, mamba_block_size=mamba_block_size
+    )
+    state._mamba_spec = (
+        None
+        if mamba_spec_block_size is None
+        else SimpleNamespace(block_size=mamba_spec_block_size)
+    )
+    return state
+
+
+def test_align_block_size_prefers_the_mamba_spec() -> None:
+    state = _align_state(
+        mamba_spec_block_size=_MAMBA_BLOCK_SIZE,
+        mamba_block_size=_MAMBA_BLOCK_SIZE,
+        block_size=_SMALLEST_GROUP_BLOCK_SIZE,
+    )
+    assert state._mamba_align_block_size() == _MAMBA_BLOCK_SIZE
+
+
+def test_align_block_size_falls_back_to_mamba_block_size() -> None:
+    """add_request can run before the first preprocess_state resolves the spec."""
+    state = _align_state(
+        mamba_spec_block_size=None,
+        mamba_block_size=_MAMBA_BLOCK_SIZE,
+        block_size=_SMALLEST_GROUP_BLOCK_SIZE,
+    )
+    assert state._mamba_align_block_size() == _MAMBA_BLOCK_SIZE
+
+
+def test_align_block_size_never_falls_back_to_cache_block_size() -> None:
+    """With no mamba block size available it must raise, not silently use the
+    smallest group's block size -- that fallback is the original defect."""
+    state = _align_state(
+        mamba_spec_block_size=None,
+        mamba_block_size=None,
+        block_size=_SMALLEST_GROUP_BLOCK_SIZE,
+    )
+    with pytest.raises(RuntimeError, match="mamba block size"):
+        state._mamba_align_block_size()
+
+
+@pytest.mark.parametrize("num_computed_tokens", [10975, 45472, 136510])
+def test_add_request_seeds_state_column_with_the_mamba_block_size(
+    monkeypatch: pytest.MonkeyPatch, num_computed_tokens: int
+) -> None:
+    """The regression itself: a prefix-cache hit must seed from the mamba block
+    size, not from the (much smaller) rewritten cache_config.block_size."""
+    state = _align_state(
+        mamba_spec_block_size=_MAMBA_BLOCK_SIZE,
+        mamba_block_size=_MAMBA_BLOCK_SIZE,
+        block_size=_SMALLEST_GROUP_BLOCK_SIZE,
+    )
+    state.num_accepted_tokens_gpu = torch.zeros(4, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32)
+    monkeypatch.setattr(
+        MambaHybridModelState.__bases__[0], "add_request", lambda *a, **k: None
+    )
+
+    state.add_request(2, Mock(num_computed_tokens=num_computed_tokens))
+
+    expected = (num_computed_tokens - 1) // _MAMBA_BLOCK_SIZE
+    buggy = (num_computed_tokens - 1) // _SMALLEST_GROUP_BLOCK_SIZE
+    assert int(state._mamba_state_idx_gpu[2]) == expected
+    # Guard the specific wrong value, so a future "simplification" back to
+    # cache_config.block_size fails loudly here rather than as a CUDA fault.
+    assert int(state._mamba_state_idx_gpu[2]) != buggy
+
+
+def test_add_request_seeds_minus_one_for_a_fresh_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """num_computed_tokens == 0 must stay -1 (nothing to copy) -- the property
+    that kept non-prefix-cache traffic working even with the bug present."""
+    state = _align_state(
+        mamba_spec_block_size=_MAMBA_BLOCK_SIZE,
+        mamba_block_size=_MAMBA_BLOCK_SIZE,
+        block_size=_SMALLEST_GROUP_BLOCK_SIZE,
+    )
+    state.num_accepted_tokens_gpu = torch.zeros(4, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32)
+    monkeypatch.setattr(
+        MambaHybridModelState.__bases__[0], "add_request", lambda *a, **k: None
+    )
+
+    state.add_request(1, Mock(num_computed_tokens=0))
+
+    assert int(state._mamba_state_idx_gpu[1]) == -1

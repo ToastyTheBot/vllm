@@ -3505,3 +3505,197 @@ def test_default_off_load_weights_matches_the_stock_contract() -> None:
     assert loaded == {"ngram_embedding.weight"}
     expected = torch.cat((shard_0[2:4], shard_1[0:2]))
     torch.testing.assert_close(embedding.weight, expected)
+
+
+# --------------------------------------------------------------------------- #
+# NVFP4 tables.
+#
+# An NVFP4 PLE table differs from the FP8/BF16 tables above in two ways that
+# the rest of this file never exercises: rows are packed two values per byte
+# (so a shard is embedding_dim/2 BYTES wide, not embedding_dim), and the scales
+# are per-ROW group-16 blocks sharded alongside the weights plus one fp32
+# weight_scale_2 -- not a single global scalar.
+# --------------------------------------------------------------------------- #
+
+_NVFP4_HEAD_DIM = 160  # Qwen3.8-Flash-Next: 2560 / 16 ngram heads
+_NVFP4_PACKED_COLS = _NVFP4_HEAD_DIM // 2  # 80 bytes per row
+_NVFP4_SCALE_COLS = _NVFP4_HEAD_DIM // ple_mmap.NVFP4_BLOCK_SIZE  # 10
+
+
+def _write_nvfp4_ple_layer(
+    directory: Path,
+    *,
+    layer_idx: int = 0,
+    vocab: int = 64,
+    parts: int = 4,
+    packed_cols: int = _NVFP4_PACKED_COLS,
+    scale_cols: int = _NVFP4_SCALE_COLS,
+    global_scale: float = 3.324236240587197e-05,
+    write_scale_shards: bool = True,
+    write_global_scale: bool = True,
+    scale_shard_dtype: torch.dtype = torch.float8_e4m3fn,
+    table_dtype: torch.dtype = torch.uint8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write one NVFP4 PLE layer. Returns (packed_weights, block_scales)."""
+    prefix = (
+        f"model.language_model.layers.{layer_idx}.ple.ple_embedding.ngram_embedding"
+    )
+    shard_size = (vocab + parts - 1) // parts
+    packed = (
+        torch.arange(vocab * packed_cols, dtype=torch.int64).reshape(vocab, packed_cols)
+        % 251
+    ).to(table_dtype)
+    scales = (
+        torch.remainder(
+            torch.arange(vocab * scale_cols, dtype=torch.float32).reshape(
+                vocab, scale_cols
+            ),
+            5.0,
+        )
+        + 0.5
+    ).to(scale_shard_dtype)
+    for shard_index in range(parts):
+        start = shard_index * shard_size
+        rows = max(0, min(shard_size, vocab - start))
+        tensors: dict[str, torch.Tensor] = {}
+        if rows > 0:
+            tensors[f"{prefix}.shard_{shard_index}.weight"] = packed[
+                start : start + rows
+            ]
+            if write_scale_shards:
+                tensors[f"{prefix}.shard_{shard_index}.weight_scale"] = scales[
+                    start : start + rows
+                ]
+        if write_global_scale and shard_index == 0:
+            tensors[f"{prefix}.weight_scale_2"] = torch.tensor(
+                [global_scale], dtype=torch.float32
+            )
+        if tensors:
+            safetensors.torch.save_file(
+                tensors,
+                str(
+                    directory
+                    / f"model-nvfp4-{layer_idx}-{shard_index:05d}.safetensors"
+                ),
+            )
+    return packed, scales
+
+
+def test_discover_shards_finds_nvfp4_block_scales_and_global_scale(
+    tmp_path: Path,
+) -> None:
+    _write_nvfp4_ple_layer(tmp_path)
+    layers = ple_mmap.discover_shards(str(tmp_path))
+
+    shards = layers[0]
+    assert ple_mmap.is_nvfp4(shards)
+    assert shards.cols == _NVFP4_PACKED_COLS
+    assert shards.dtype_str == "U8"
+    assert shards.scale_cols == _NVFP4_SCALE_COLS
+    assert shards.scale_dtype_str == "F8_E4M3"
+    assert set(shards.scale_shards) == set(shards.shards)
+    assert shards.global_scale_entry is not None
+
+
+def test_discover_shards_does_not_mistake_shard_scales_for_the_layer_scale(
+    tmp_path: Path,
+) -> None:
+    """shard_N.weight_scale and the FP8 path's ngram_embedding.weight_scale are
+    different tensors; the $-anchored regexes must not cross-match."""
+    _write_nvfp4_ple_layer(tmp_path)
+    shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    assert shards.scale_entry is None  # no per-layer FP8 scalar in an NVFP4 layer
+    assert len(shards.scale_shards) == len(shards.shards)
+
+
+def test_bf16_layer_is_not_detected_as_nvfp4(tmp_path: Path) -> None:
+    _write_ple_layer(
+        tmp_path,
+        layer_idx=0,
+        vocab=64,
+        parts=4,
+        cols=16,
+        scale=1.0,
+        write_scale=False,
+        table_dtype=torch.bfloat16,
+    )
+    assert not ple_mmap.is_nvfp4(ple_mmap.discover_shards(str(tmp_path))[0])
+
+
+def _validate_nvfp4(tmp_path: Path, head_dim: int = _NVFP4_HEAD_DIM):
+    shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    return ple_mmap._validate_layer_shards(shards, head_dim, 0, str(tmp_path))
+
+
+def test_validate_accepts_a_well_formed_nvfp4_layer(tmp_path: Path) -> None:
+    _write_nvfp4_ple_layer(tmp_path)
+    # Returns None: NVFP4 has no single per-layer scale entry to hand back.
+    assert _validate_nvfp4(tmp_path) is None
+
+
+def test_validate_rejects_nvfp4_shard_width_that_is_not_half_the_head_dim(
+    tmp_path: Path,
+) -> None:
+    _write_nvfp4_ple_layer(tmp_path, packed_cols=_NVFP4_HEAD_DIM)
+    with pytest.raises(RuntimeError, match="NVFP4 shard width"):
+        _validate_nvfp4(tmp_path)
+
+
+def test_validate_rejects_wrong_block_scale_width(tmp_path: Path) -> None:
+    _write_nvfp4_ple_layer(tmp_path, scale_cols=_NVFP4_SCALE_COLS + 1)
+    with pytest.raises(RuntimeError, match="NVFP4 block-scale width"):
+        _validate_nvfp4(tmp_path)
+
+
+def test_validate_rejects_non_e4m3_block_scales(tmp_path: Path) -> None:
+    _write_nvfp4_ple_layer(tmp_path, scale_shard_dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="NVFP4 block scales have dtype"):
+        _validate_nvfp4(tmp_path)
+
+
+def test_validate_rejects_a_missing_weight_scale_2(tmp_path: Path) -> None:
+    _write_nvfp4_ple_layer(tmp_path, write_global_scale=False)
+    with pytest.raises(RuntimeError, match="weight_scale_2"):
+        _validate_nvfp4(tmp_path)
+
+
+def test_validate_rejects_non_u8_shards_that_carry_block_scales(
+    tmp_path: Path,
+) -> None:
+    """Per-shard block scales imply packed NVFP4; anything else is malformed."""
+    _write_nvfp4_ple_layer(tmp_path, table_dtype=torch.float8_e4m3fn)
+    with pytest.raises(RuntimeError, match="packed NVFP4 shards must be U8"):
+        _validate_nvfp4(tmp_path)
+
+
+def test_nvfp4_block_scale_table_gathers_the_same_rows_as_the_weight_table(
+    tmp_path: Path,
+) -> None:
+    """The two tables are keyed by the same row ids; a row's weights and its
+    block scales must come from the same logical row or every embedding past
+    the skew point is silently wrong."""
+    vocab, parts = 64, 4
+    packed, scales = _write_nvfp4_ple_layer(tmp_path, vocab=vocab, parts=parts)
+    shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    shard_size = (vocab + parts - 1) // parts
+
+    weight_table = ple_mmap.MmapPleTable(
+        shards.shards, shard_size, _NVFP4_PACKED_COLS, torch.uint8,
+        workers=2, chunk=8, model_path=str(tmp_path),
+    )
+    scale_table = ple_mmap.MmapPleTable(
+        shards.scale_shards, shard_size, _NVFP4_SCALE_COLS, torch.float8_e4m3fn,
+        workers=2, chunk=8, model_path=str(tmp_path),
+    )
+    try:
+        assert scale_table.rows_total == weight_table.rows_total == vocab
+        ids = np.array([0, 63, 17, 17, 32, 1], dtype=np.int64)
+        got_w = torch.from_numpy(weight_table.gather(ids))
+        got_s = torch.from_numpy(scale_table.gather(ids)).view(torch.float8_e4m3fn)
+        torch.testing.assert_close(got_w, packed[ids], rtol=0, atol=0)
+        torch.testing.assert_close(
+            got_s.to(torch.float32), scales[ids].to(torch.float32), rtol=0, atol=0
+        )
+    finally:
+        scale_table.close()
+        weight_table.close()

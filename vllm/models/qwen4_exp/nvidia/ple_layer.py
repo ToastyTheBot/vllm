@@ -568,12 +568,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     # table before any forward, or the placeholder raises
                     # instead of silently serving fp8 zeros.
                     #
-                    # The width check below is deliberately skipped rather than
-                    # run first: it assumes one element per column, which is
-                    # false for a packed NVFP4 table (2 values/byte, so the
-                    # shard is embedding_dim/2 wide). ple_mmap's own discovery
-                    # and _validate_layer_shards are authoritative for these
-                    # shards, and check width against the actual on-disk dtype.
+                    # Only the COLUMN half of the shape check below is skipped.
+                    # It assumes one element per column, which is false for a
+                    # packed NVFP4 table (2 values/byte, so the shard is
+                    # embedding_dim/2 wide); ple_mmap's discovery validates
+                    # width against the actual on-disk dtype instead. The row
+                    # count is dtype-independent, so it is still checked here.
+                    if loaded_weight.shape[0] != expected_rows:
+                        raise ValueError(
+                            f"Shape mismatch for PLE embedding shard "
+                            f"{shard_index}: expected {expected_rows} rows, "
+                            f"got {loaded_weight.shape[0]}"
+                        )
                     embedding.weights_streamed = True
                     loaded.add("ngram_embedding.weight")
                     continue
