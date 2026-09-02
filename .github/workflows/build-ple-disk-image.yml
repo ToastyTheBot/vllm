@@ -25,7 +25,7 @@ on:
         type: boolean
         default: true
       version:
-        description: "Version for the v<N> tag, e.g. 1.1.0 (omit to tag by sha only)"
+        description: "Experiment number for the v<N> tag: 1, 2, 3 ... (omit to tag by sha only)"
         type: string
         required: false
       make_latest:
