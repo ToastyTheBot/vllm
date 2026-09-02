@@ -61,7 +61,14 @@ COPY . .
 # build these Python changes were developed and validated against.
 ARG VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/39e276eaeb9daed06a180f6a8d187bbb8790e97b/vllm-0.28.1rc1.dev164%2Bg39e276eae-cp38-abi3-manylinux_2_28_x86_64.whl
 ENV VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION}
-RUN VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+#
+# --torch-backend must be pinned, NOT left at auto. uv's auto detection probes
+# for a GPU/driver; a CPU-only build host has neither, so it silently resolves
+# a CPU-only torch. The build still succeeds and the image still pushes -- it
+# just cannot serve. cu130 matches this base image's CUDA 13.0 and the torch
+# 2.13.0+cu130 the pinned vLLM wheel is built against.
+ARG TORCH_BACKEND=cu130
+RUN VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=${TORCH_BACKEND}
 
 # Keep JIT caches on a mounted volume so the ~90 s flashinfer sm120 build and
 # the torch.compile artifacts survive container restarts.
