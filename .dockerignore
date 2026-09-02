@@ -36,3 +36,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 rust/target/
+
+# Session evidence + rented-box artifacts: never needed in the image, and
+# ~3 MB of context on every build.
+/repro-vast/
