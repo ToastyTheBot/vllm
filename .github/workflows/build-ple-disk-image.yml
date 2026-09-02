@@ -24,6 +24,14 @@ on:
         description: "Push to GHCR (uncheck to build only)"
         type: boolean
         default: true
+      version:
+        description: "Version for the v<N> tag, e.g. 1.1.0 (omit to tag by sha only)"
+        type: string
+        required: false
+      make_latest:
+        description: "Also move :latest to this build (only for the most performant config)"
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -95,9 +103,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ steps.img.outputs.name }}
+          # :latest is NOT moved by a plain branch push. It marks the
+          # best-measured configuration, so it only moves when a run is
+          # dispatched with make_latest -- otherwise a routine source push
+          # would silently retag the production image to an unmeasured build.
+          # Every build is still addressable by its immutable sha tag.
           tags: |
-            type=raw,value=latest
             type=sha,format=long
+            type=raw,value=v${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' && inputs.make_latest }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
