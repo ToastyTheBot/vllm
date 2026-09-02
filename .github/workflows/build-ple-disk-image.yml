@@ -119,6 +119,13 @@ jobs:
                   "$IMAGE_REF" - <<'PYEOF'
           import torch
           import vllm.envs as envs
+
+          # Import the model module first. qsa.py and model.py import each
+          # other, and the cycle only resolves in that order -- reaching for
+          # nvidia.qsa directly raises ImportError on a partially initialized
+          # module. This mirrors how vLLM itself loads the package.
+          import vllm.models.qwen4_exp.nvidia.model  # noqa: F401
+          from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
           from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
           from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
               MambaHybridModelState,
@@ -132,7 +139,6 @@ jobs:
           assert qsa_ops._FP8_KV_DTYPES, "fp8 KV dtypes missing from ops.qsa"
 
           # fp8 KV on the QSA path.
-          from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
           assert "fp8" in qsa_mod._QSA_SUPPORTED_KV_CACHE_DTYPES, "fp8 KV missing"
           assert "fp8_e5m2" not in qsa_mod._QSA_SUPPORTED_KV_CACHE_DTYPES, (
               "e5m2 must stay refused at init"
