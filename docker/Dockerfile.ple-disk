@@ -45,11 +45,22 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN uv venv --python 3.12 /opt/venv
 
 WORKDIR /workspace/vllm
+# setup.py derives a version from git metadata, so .git must be present.
 COPY . .
 
 # Editable install against a precompiled wheel: every change on this branch is
-# pure Python (ple_mmap.py, ple_layer.py, model.py, envs.py, compilation.py),
-# so no CUDA compilation is needed to carry it.
+# pure Python (ple_mmap.py, ple_layer.py, model.py, qsa.py, ops/qsa.py,
+# envs.py, compilation.py, mamba_hybrid.py), so no CUDA compilation is needed
+# to carry it -- which is what keeps this buildable on a CPU-only CI runner.
+#
+# The wheel is pinned explicitly rather than auto-detected. setup.py otherwise
+# calls detect_system_cuda_variant(), which needs nvidia-smi or an installed
+# torch to pick a CUDA variant -- neither exists on a GPU-less build host, and
+# the failure mode is a confusing metadata-fetch error rather than a clear one.
+# This URL is the wheel for the branch's base commit (39e276eae), which is the
+# build these Python changes were developed and validated against.
+ARG VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/39e276eaeb9daed06a180f6a8d187bbb8790e97b/vllm-0.28.1rc1.dev164%2Bg39e276eae-cp38-abi3-manylinux_2_28_x86_64.whl
+ENV VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION}
 RUN VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
 
 # Keep JIT caches on a mounted volume so the ~90 s flashinfer sm120 build and
