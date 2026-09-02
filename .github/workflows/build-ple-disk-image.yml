@@ -59,6 +59,13 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      # RUN --mount=type=cache in the Dockerfile is builder-local and does not
+      # survive between runs on ephemeral runners. This restores/persists it so
+      # the uv download cache carries over, which matters because the
+      # dependency layer pulls a ~4 GiB torch.
+      - name: Expose GHA cache to BuildKit
+        uses: crazy-max/ghaction-github-runtime@v3
+
       - name: Log in to GHCR
         # Skipped for build-only runs so the job still works without
         # package-write access.
@@ -101,7 +108,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Registry cache rather than the local one: the layers are far too
-          # large to keep on the runner alongside the build itself.
+          # large to keep on the runner alongside the build itself. mode=max
+          # exports intermediate layers too, which is what lets a source-only
+          # change reuse the dependency and flashinfer-AOT layers instead of
+          # rebuilding ~4 GiB of torch and recompiling the MoE kernels.
           cache-from: type=registry,ref=${{ steps.img.outputs.name }}:buildcache
           cache-to: ${{ (github.event_name != 'workflow_dispatch' || inputs.push_image) && format('type=registry,ref={0}:buildcache,mode=max', steps.img.outputs.name) || '' }}
           provenance: false
