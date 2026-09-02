@@ -102,6 +102,44 @@ jobs:
           cache-to: ${{ (github.event_name != 'workflow_dispatch' || inputs.push_image) && format('type=registry,ref={0}:buildcache,mode=max', steps.img.outputs.name) || '' }}
           provenance: false
 
+      # A green build only proves the layers assembled. This asserts the
+      # image actually carries a CUDA torch and this branch's changes -- the
+      # failure mode being guarded against is a precompiled-wheel install that
+      # silently resolves to something other than what was validated.
+      - name: Smoke test the image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+        env:
+          IMAGE_REF: ${{ steps.img.outputs.name }}:sha-${{ github.sha }}
+        run: |
+          docker run --rm --entrypoint /opt/venv/bin/python "$IMAGE_REF" - <<'PYEOF'
+          import torch
+          import vllm.envs as envs
+          from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+          from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+              MambaHybridModelState,
+          )
+
+          print("torch", torch.__version__, "cuda", torch.version.cuda)
+          assert torch.version.cuda, "image has a CPU-only torch"
+
+          # PLE disk offload (NVFP4 support lives behind this flag).
+          assert hasattr(envs, "VLLM_PLE_MMAP"), "VLLM_PLE_MMAP missing"
+          assert qsa_ops._FP8_KV_DTYPES, "fp8 KV dtypes missing from ops.qsa"
+
+          # fp8 KV on the QSA path.
+          from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
+          assert "fp8" in qsa_mod._QSA_SUPPORTED_KV_CACHE_DTYPES, "fp8 KV missing"
+          assert "fp8_e5m2" not in qsa_mod._QSA_SUPPORTED_KV_CACHE_DTYPES, (
+              "e5m2 must stay refused at init"
+          )
+
+          # The hybrid-mamba prefix-caching fix.
+          assert hasattr(MambaHybridModelState, "_mamba_align_block_size"), (
+              "mamba align block-size fix missing"
+          )
+          print("image carries: PLE mmap + NVFP4, fp8 KV on QSA, mamba fix")
+          PYEOF
+
       - name: Summary
         if: always()
         # Interpolations go through env rather than straight into run:, per
