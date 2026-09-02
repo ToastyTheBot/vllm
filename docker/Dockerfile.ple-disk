@@ -115,13 +115,20 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     VLLM_USE_PRECOMPILED=1 uv pip install -e . --no-deps
 
-# Keep JIT caches on a mounted volume so any remaining JIT work and the
-# torch.compile artifacts survive container restarts. XDG_CACHE_HOME is set
-# AFTER the AOT build above so the prebuilt kernels stay baked into the image
-# at /root/.cache/flashinfer rather than landing in a mount point.
+# Keep JIT caches on a mounted volume so the flashinfer build and the
+# torch.compile artifacts survive container restarts.
+#
+# FLASHINFER_WORKSPACE_BASE is load-bearing and easy to miss: flashinfer does
+# NOT honour XDG_CACHE_HOME. jit/env.py computes its cache as
+#   FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+# where FLASHINFER_BASE_DIR = os.getenv("FLASHINFER_WORKSPACE_BASE", HOME).
+# Without it the fused_moe_120 build lands in /root/.cache/flashinfer, which is
+# in the container's writable layer and is therefore thrown away on every
+# `docker run` -- paying the full ~20 minute compile on each new container.
 ENV XDG_CACHE_HOME=/cache
 ENV VLLM_CACHE_ROOT=/cache/vllm
 ENV TRITON_CACHE_DIR=/cache/triton
+ENV FLASHINFER_WORKSPACE_BASE=/cache
 
 # Serve the n-gram table from disk rather than GPU/host memory.
 ENV VLLM_PLE_MMAP=1
