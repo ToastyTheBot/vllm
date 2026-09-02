@@ -27,7 +27,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/vllm-ple-disk
 
 jobs:
   build:
@@ -70,11 +69,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # github.repository preserves the owner's casing, but registry
+      # references must be lowercase. metadata-action lowercases the tags it
+      # generates; the cache refs below are raw strings and are not covered by
+      # that, so compute a lowercase name once and use it for both.
+      - name: Compute lowercase image name
+        id: img
+        env:
+          RAW_IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}/vllm-ple-disk
+        run: echo "name=${RAW_IMAGE,,}" >> "$GITHUB_OUTPUT"
+
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.img.outputs.name }}
           tags: |
             type=raw,value=latest
             type=sha,format=long
@@ -89,8 +98,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # Registry cache rather than the local one: the layers are far too
           # large to keep on the runner alongside the build itself.
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: ${{ (github.event_name != 'workflow_dispatch' || inputs.push_image) && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          cache-from: type=registry,ref=${{ steps.img.outputs.name }}:buildcache
+          cache-to: ${{ (github.event_name != 'workflow_dispatch' || inputs.push_image) && format('type=registry,ref={0}:buildcache,mode=max', steps.img.outputs.name) || '' }}
           provenance: false
 
       - name: Summary
@@ -100,7 +109,7 @@ jobs:
         # event-controlled, but the habit is cheap.
         env:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          IMAGE_REF: ${{ steps.img.outputs.name }}:latest
         run: |
           {
             echo "### PLE disk-offload image"
