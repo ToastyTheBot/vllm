@@ -145,7 +145,15 @@ Blackwell constrained to ~28 GiB of host memory:
 
 `--moe-backend marlin` is the recommendation: roughly 20x faster to start, and
 it removes the JIT step that is actively fatal on a small host (see
-`MAX_JOBS` above).
+`MAX_JOBS` above). With caches already warm it drops further -- a second boot
+measured `init engine ... took 22.15 s (compilation: 0.33 s)`, leaving model
+load as the only meaningful startup cost.
+
+Marlin is accuracy-neutral here, not just faster: **estonia 30/30**, 0 errors,
+under the same 28 GiB constraint with fp8 KV, MTP 3 and prefix caching
+(`repro-vast/ple-disk/startup/`). Worth stating explicitly because an earlier
+revision of these notes wrongly accused Marlin of numerical corruption on a
+confounded comparison; it is measured correct on this checkpoint.
 
 Two caveats on the JIT path if you keep it. It must be able to persist its
 cache -- see `FLASHINFER_WORKSPACE_BASE` in the Dockerfile, since flashinfer

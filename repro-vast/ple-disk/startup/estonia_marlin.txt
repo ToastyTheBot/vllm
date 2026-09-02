@@ -1,0 +1,15 @@
+### estonia on MARLIN NVFP4 MoE
+RTX PRO 6000 Blackwell Workstation Edition 96GB sm_120, driver 595.71.05
+memory constrained to ~28 GiB (vLLM reported Available RAM: 25.75 GiB)
+fp8_e4m3 KV, MTP 3, prefix caching, engrams on disk, b12x NOT installed
+09-02 12:30:22 [nvfp4.py:261] Using 'MARLIN' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASH
+09-02 12:32:40 [kv_cache_utils.py:2020] GPU KV cache size: 748,255 tokens, Maximum concurrency for 262,144 tokens per 
+09-02 12:32:48 [core.py:361] init engine (profile, create kv cache, warmup model) took 22.15 s (compilation: 0.33 s)
+
+=== result ===
+  completed    30
+  correct      30
+  fail         0
+  errors       0
+  correct_rate 1.0
+  tokens p50/p90/max: 2953/4402/6215
