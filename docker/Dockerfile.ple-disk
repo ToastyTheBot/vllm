@@ -2,12 +2,19 @@
 # ("engram") table streamed from disk, so host RAM stays small.
 #
 # Build:
-#   docker build -f docker/Dockerfile.ple-disk -t vllm-ple-disk .
+#   docker build -f docker/Dockerfile.ple-disk -t vllm-openai .
+#
+# Named vllm-openai to match upstream's published image, but it is NOT a
+# drop-in replacement: the entrypoint takes the model path as its first
+# positional argument, rewrites the checkpoint's config.json to upstream's
+# qwen4_exp naming, and forces the PIECEWISE cudagraph mode the disk-backed
+# PLE gather requires. Everything after the model path is passed through to
+# `vllm serve`.
 #
 # Run (see docs/features/ple_disk_offload.md for the full recipe):
 #   docker run --gpus all --ipc=host -p 8000:8000 \
 #     -v /path/to/checkpoint:/model:ro -v /path/to/nvme-cache:/cache \
-#     vllm-ple-disk /model
+#     vllm-openai /model
 #
 # Why each pin below is here — every one of these was a real failure:
 #

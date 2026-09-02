@@ -69,14 +69,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # github.repository preserves the owner's casing, but registry
+      # Named vllm-openai to match upstream's published image
+      # (docker.io/vllm/vllm-openai): same owner/name shape, so the only
+      # difference from upstream is the registry and owner.
+      #
+      # The owner's casing is preserved by github.repository_owner but registry
       # references must be lowercase. metadata-action lowercases the tags it
       # generates; the cache refs below are raw strings and are not covered by
       # that, so compute a lowercase name once and use it for both.
       - name: Compute lowercase image name
         id: img
         env:
-          RAW_IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}/vllm-ple-disk
+          RAW_IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vllm-openai
         run: echo "name=${RAW_IMAGE,,}" >> "$GITHUB_OUTPUT"
 
       - name: Image metadata
@@ -181,6 +185,12 @@ jobs:
             echo "  -v /path/to/checkpoint:/model -v /path/to/nvme-cache:/cache \\"
             echo "  $IMAGE_REF /model"
             echo '```'
+            echo
+            echo "Named vllm-openai to match upstream, but not a drop-in"
+            echo "replacement: the model path is the first positional argument,"
+            echo "and the entrypoint forces the PIECEWISE cudagraph mode the"
+            echo "disk-backed PLE gather requires. Later args pass through to"
+            echo "vllm serve."
             echo
             echo "The checkpoint volume is mounted read-write on purpose: the"
             echo "entrypoint rewrites config.json from the downstream"
