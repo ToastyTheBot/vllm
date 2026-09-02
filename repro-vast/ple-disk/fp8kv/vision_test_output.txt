@@ -1,0 +1,8 @@
+--- /workspace/shapes.png
+    prompt_tokens=265 completion=85
+    expected ['red', 'blue'] -> found ['red', 'blue']  PASS
+    answer: "itions. I need to look carefully at the image. There's a red circle in the upper-left area and a blue square in the lower-right area. The background is white. I should keep it concise as instructed, just stating the facts without extra fluff.\n</think>\n\nA red circle in the top-left and a blue square in the bottom-right."
+--- /workspace/digit.png
+    prompt_tokens=265 completion=65
+    expected ['7'] -> found ['7']  PASS
+    answer: 'The user wants the single digit from the image. The image shows a black numeral inside a square border. The shape has a horizontal top bar and a diagonal stroke descending to the left, characteristic of the digit 7. No other digits are present. The instruction is to answer with just the digit.\n</think>\n\n7'

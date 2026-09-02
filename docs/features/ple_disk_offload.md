@@ -78,9 +78,12 @@ With `--gpu-memory-utilization 0.95 --max-model-len 180224` and MTP 3:
 
 ```
 PLE mmap: layer 1 attached (nvfp4), 128 shards, 320001536 rows x 80 B (23.84 GiB on disk), 32 workers
-Model loading took 73.07 GiB memory and 75.8 seconds
-GPU KV cache size: 454,594 tokens
+Model loading took 73.07 GiB memory and 83.257126 seconds
+GPU KV cache size: 454,594 tokens, Maximum concurrency for 180,224 tokens per request: 2.52x
 ```
+
+(Verbatim from one run; see `repro-vast/ple-disk/final_metrics.txt`. Load time
+varies run to run -- 70.8 s to 86.7 s observed -- with page-cache warmth.)
 
 Host memory splits into two very different parts, and they should be read
 separately:
@@ -114,10 +117,12 @@ of weights does not fit in 96 GB of VRAM.
   group's block size on a hybrid model (4 here, versus a mamba block size of
   1568). With the fix in this branch, the 30-run estonia long-context suite
   scores 30/30 with prefix caching enabled.
-- **KV cache dtype must stay bf16.** Upstream's Qwen4Exp QSA kernel raises
-  `Qwen4Exp QSA requires a BF16 main KV cache` for any other value
-  (`vllm/models/qwen4_exp/nvidia/qsa.py`), so `--kv-cache-dtype fp8` is not
-  available for this model.
+- **`--kv-cache-dtype fp8` is supported** (E4M3 only). The QSA Triton kernel
+  dequantizes fp8 pages to the query dtype on load with the same per-tensor
+  `k_scale`/`v_scale` used to write them. On one RTX PRO 6000 96 GB it gives
+  780,970 KV tokens against 454,594 for bf16 -- 1.72x -- and scores the same
+  30/30 on the estonia long-context suite. E5M2 is refused at startup: the
+  kernel could handle it, but nothing here has validated it.
 - **Checkpoints exported under downstream naming** (`model_type:
   qwen3_8_flash_next`, `Qwen3_8FlashNextForConditionalGeneration`) must be
   remapped to the names upstream registers — `qwen4_exp` /

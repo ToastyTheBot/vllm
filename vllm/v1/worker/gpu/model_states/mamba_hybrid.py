@@ -137,9 +137,15 @@ class MambaHybridModelState(DefaultModelState):
         the state stride and faults. ``num_computed_tokens == 0`` yields -1 for
         any positive divisor, which is why only prefix-cache hits ever crashed.
 
-        ``mamba_block_size`` is never rewritten, so it is the safe fallback for
-        the window before the spec is resolved (``add_request`` can run before
-        the first ``preprocess_state``).
+        ``cache_config.mamba_block_size`` is the safe fallback for the window
+        before the spec is resolved (``add_request`` can run before the first
+        ``preprocess_state``). Note it *is* written during config resolution --
+        ``platforms/interface.py`` sets it in align mode and ``models/config.py``
+        supplies a default -- but both happen before workers start and land on
+        exactly the value ``MambaSpec.block_size`` is later copied from, so the
+        fallback agrees with the spec. What must never be used is
+        ``cache_config.block_size``, which EngineCore repurposes after that
+        point.
         """
         spec = self._mamba_spec
         if spec is not None:

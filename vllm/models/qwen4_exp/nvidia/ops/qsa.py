@@ -8,6 +8,14 @@ import torch
 
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+_FP8_KV_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+    torch.float8_e5m2fnuz,
+)
+
+
 
 @triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
@@ -20,6 +28,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -45,6 +55,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -108,6 +119,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[None, :],
             other=0.0,
         )
+        if USE_FP8:
+            # Per-tensor scalar scales (vLLM's default for --kv-cache-dtype
+            # fp8). Dequantize to the query dtype before the dot so the MMA
+            # stays in the BF16 path the rest of this kernel assumes.
+            keys = (keys.to(query.dtype) * tl.load(k_scale_ptr)).to(query.dtype)
         values = tl.load(
             v_cache_ptr
             + safe_page[:, None] * stride_v_block
@@ -117,6 +133,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if USE_FP8:
+            values = (values.to(query.dtype) * tl.load(v_scale_ptr)).to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -416,8 +434,16 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged K/V caches.
+
+    The caches may be BF16, or fp8 with per-tensor scalar ``k_scale`` /
+    ``v_scale`` (what ``--kv-cache-dtype fp8`` produces). fp8 pages are
+    dequantized to the query dtype inside the kernel, so the MMA path is
+    unchanged; only the loads differ.
+    """
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -435,7 +461,27 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    use_fp8 = k_cache.dtype in _FP8_KV_DTYPES
+    assert q.dtype == torch.bfloat16
+    assert k_cache.dtype == v_cache.dtype
+    if use_fp8:
+        if k_scale is None or v_scale is None:
+            raise ValueError(
+                "QSA sparse attention needs k_scale and v_scale for an fp8 "
+                "KV cache"
+            )
+        if k_scale.numel() != 1 or v_scale.numel() != 1:
+            # Fail closed rather than silently applying the wrong scale: the
+            # kernel reads a single scalar per cache.
+            raise ValueError(
+                "QSA sparse attention supports only per-tensor scalar KV "
+                f"scales, got k_scale.numel()={k_scale.numel()} "
+                f"v_scale.numel()={v_scale.numel()}"
+            )
+        if k_scale.device != q.device or v_scale.device != q.device:
+            raise ValueError("QSA KV scales must live on the query's device")
+    else:
+        assert k_cache.dtype == torch.bfloat16
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -503,6 +549,8 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        k_scale if use_fp8 else out,
+        v_scale if use_fp8 else out,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -528,8 +576,13 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        USE_FP8=use_fp8,
         num_warps=partial_warps,
-        num_stages=2,
+        # The fp8 path materializes a dequantized BF16 tile alongside the fp8
+        # one it was loaded from, which on top of 2-stage pipelining exceeds
+        # sm120's 99 KB shared-memory budget ("out of resource: shared memory,
+        # Required: 106496, Hardware limit: 101376"). One stage fits.
+        num_stages=1 if use_fp8 else 2,
     )
     if num_splits == 1:
         return out
