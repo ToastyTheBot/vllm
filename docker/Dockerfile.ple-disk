@@ -32,7 +32,7 @@
 
 #
 # LAYER ORDER IS LOAD-BEARING. Everything expensive and source-independent
-# (torch, the vLLM wheel, the flashinfer AOT compile) happens BEFORE `COPY . .`
+# (torch and the pinned vLLM wheel) happens BEFORE `COPY . .`
 # so that editing a Python file in this repo does not invalidate a ~4 GiB
 # dependency install and a multi-minute kernel build. Only the last two layers
 # rebuild on a source change.
@@ -76,38 +76,32 @@ ARG TORCH_BACKEND=cu130
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv pip install "${VLLM_PRECOMPILED_WHEEL_LOCATION}" --torch-backend=${TORCH_BACKEND}
 
-# --- flashinfer AOT: also source-independent, so also cached ----------------
+# --- flashinfer JIT: bound its build parallelism ---------------------------
 #
-# Without this, the first boot JIT-compiles fused_moe_120 on the serving host.
-# On a small host that is the dominant startup cost and can be fatal: with
-# MAX_JOBS unset, flashinfer passes no -j and ninja defaults to nproc+2
-# concurrent nvcc jobs at 1-3 GiB each, which the OOM killer terminates
-# (ninja exits 137, taking EngineCore with it). Even when it survives it costs
-# 10+ minutes on every cold cache.
+# On the first boot flashinfer JIT-compiles fused_moe_120 on the serving host.
+# With MAX_JOBS unset, flashinfer's _get_num_workers() returns None, so no -j
+# reaches ninja and it defaults to nproc+2 concurrent nvcc jobs. At 1-3 GiB per
+# CUTLASS translation unit that is fatal on a small host: the OOM killer takes
+# the build and EngineCore dies with
 #
-# This is a cross-compile and needs no GPU: detect_sm_capabilities() reads the
-# arch from FLASHINFER_CUDA_ARCH_LIST via CompilationContext rather than from a
-# device, which is why it works on a CPU-only CI runner.
+#     Command '[ninja ... cached_ops/fused_moe_120 ...]' returned non-zero
+#     exit status 137          (137 = 128 + SIGKILL)
 #
-# Only --add-moe: that is the kernel family this model actually JITs. Building
-# flashinfer's full AOT set would take far longer and ship kernels never loaded
-# here. Set AOT_PRECOMPILE=0 to skip (fast image build, slow first boot).
-ARG AOT_PRECOMPILE=1
-ARG AOT_MAX_JOBS=4
-RUN if [ "${AOT_PRECOMPILE}" = "1" ]; then \
-        set -eux; \
-        MAX_JOBS=${AOT_MAX_JOBS} NVCC_THREADS=2 \
-        /opt/venv/bin/python -m flashinfer.aot \
-            --add-moe true \
-            --add-act false \
-            --add-misc false \
-            --out-dir /root/.cache/flashinfer \
-            --build-dir /tmp/fi-build; \
-        rm -rf /tmp/fi-build; \
-        echo "prebuilt kernels: $(find /root/.cache/flashinfer -name '*.so' | wc -l)"; \
-    else \
-        echo "AOT precompile skipped"; \
-    fi
+# observed on a 28 GiB / 16-core host. Capping it trades a slower one-time
+# compile for a build that survives; results land in /cache (mounted), so only
+# a cold cache pays it. Raise on a large host.
+#
+# NOT precompiled at image build time, though that would be better. Two things
+# block it with this flashinfer version:
+#   * flashinfer.aot needs the csrc/*.jinja templates, which the runtime wheel
+#     does not ship -- it fails with FileNotFoundError on
+#     batch_prefill_customize_config.jinja. AOT needs the source distribution.
+#   * the prebuilt flashinfer-jit-cache wheels only go up to 0.6.9rc1, and the
+#     cache is version-keyed (.../flashinfer/<version>/120f/...), so a 0.6.9
+#     cache is simply not consulted by the 0.6.18 runtime here.
+# Worth revisiting when a matching jit-cache wheel exists.
+ENV MAX_JOBS=2
+ENV NVCC_THREADS=2
 
 # --- source layer: everything below rebuilds on a source change ------------
 WORKDIR /workspace/vllm
