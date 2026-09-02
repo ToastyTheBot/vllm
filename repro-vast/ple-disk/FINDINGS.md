@@ -23,9 +23,12 @@ GPU KV cache size: 454,594 tokens
 | engram table, served from NVMe | 23.84 GiB |
 | backbone on GPU | 71.65 GiB (73.07 with MTP) |
 | checkpoint total | 98.53 GiB — **does not fit in 96 GB VRAM** without this |
-| engine anonymous memory (non-evictable) | **3.07 GiB** |
-| engine file-backed RSS (evictable page cache) | 25.29 GiB, of which 24.79 GiB is the safetensors mmap |
-| engine total RSS | 28.65 GiB |
+| engine anonymous memory (non-evictable) | **3.03 GiB** (`Pss_Anon`) |
+| engine file-backed RSS (evictable page cache) | 25.27 GiB (`Pss_File`), of which 24.77 GiB is the safetensors mmap |
+| engine total RSS | 28.59 GiB |
+
+Source: `fp8kv/fp8_metrics.txt` (fp8-KV run). `final_metrics.txt` from the
+bf16 run records only the totals (28.65 GiB RSS), not the split.
 
 **Read these two numbers separately.** The hard requirement is the ~3.1 GiB of
 anonymous memory. The file-backed portion is clean, mmap-backed page cache that
@@ -40,8 +43,10 @@ RSS; the anon/file split above is the accurate picture.
 Correctness of the offload path is established two ways:
 
 1. **Gather oracle** (`oracle.py`): 512 random row ids gathered through
-   `MmapPleTable` and compared byte-for-byte against `safetensors.safe_open`.
-   **0/64 mismatches on weights, 0/64 on block scales.** Dequant output finite,
+   `MmapPleTable`; the first **64 of them** byte-compared against
+   `safetensors.safe_open`. **0/64 mismatches on weights, 0/64 on block
+   scales.** (The gather is 512 wide to exercise the chunking; the byte
+   comparison covers 64.) Dequant output finite,
    absmean 0.0061, range ±0.035.
 2. **End-to-end**: the 136,562-token estonia prompt answers correctly and
    terminates cleanly — `finish=stop`, 2,267 completion tokens, final line
@@ -118,7 +123,7 @@ in this V2 align path.
 |---|---|
 | 8 rounds x 3 concurrent shared-prefix requests, up to 125,328 prompt tokens | **0 IMAs** (previously crashed in round 0, every time) |
 | estonia, 30 runs, c=6, **prefix caching ON** | **30/30 correct**, 0 errors, tokens p50/p90/max 2711/3679/5033 |
-| estonia, 30 runs, c=6, **prefix caching ON + MTP 3** | **30/30 correct**, 0 errors, mean acceptance 3.00 |
+| estonia, 30 runs, c=6, **prefix caching ON + MTP 3** | **30/30 correct**, 0 errors (`estonia_final.json`) |
 | lavd (context consistency), 30 runs, c=6, prefix caching ON | **29/30**, 0 errors |
 | estonia, 30 runs, c=3, prefix caching off | 30/30 correct (pre-fix control) |
 
@@ -134,6 +139,48 @@ What remains true: flashinfer's cutlass `mm_mxfp8` genuinely cannot serve this
 model's projection shapes on sm120 (`Problem size is not supported for
 mm_mxfp8`), so it must be disabled and selection falls through to Marlin.
 
+## fp8 KV cache: implemented
+
+Previously recorded here as unavailable. The QSA sparse-attention path now
+reads fp8 pages directly: the Triton kernel dequantizes them to the query
+dtype on load using the same per-tensor `k_scale`/`v_scale` that
+`reshape_and_cache_flash` used to write them.
+
+Five separate refusals had to be cleared, each in a different place:
+
+1. `Qwen4ExpQSABackend.supported_kv_cache_dtypes` (backend advertisement)
+2. `Qwen4ExpQSAFlashAttentionImpl.__init__` (`kv_cache_dtype` string)
+3. `Qwen4ExpQSAAttention.__init__` (`cache_config.cache_dtype`)
+4. `Qwen4ExpQSAAttention.__init__` (`kv_cache_torch_dtype`, which is
+   `torch.uint8` -- vLLM stores every fp8 mode as uint8 and kernels re-view it)
+5. `FlashAttentionImpl.__init__`, which refuses fp8 whenever FlashAttention
+   lacks device support (sm120). QSA inherits that class only for
+   `do_kv_cache_update` and metadata and never runs FA's attention kernel, so
+   the check does not apply to it.
+
+One real bug surfaced during bring-up: the dequantized BF16 tile lives
+alongside the fp8 tile it came from, and with 2-stage pipelining that exceeded
+sm120's shared-memory budget (`Required: 106496, Hardware limit: 101376`). The
+fp8 path uses `num_stages=1`.
+
+| | bf16 KV | **fp8 KV** |
+|---|---|---|
+| GPU KV cache | 454,594 tokens | **780,970 tokens** (1.72x) |
+| Max concurrency @ 180,224 | 2.52x | **4.33x** |
+| estonia, 30 runs, c=6, prefix caching + MTP 3 | 30/30 | **30/30** |
+
+fp8 KV is accuracy-neutral on this benchmark and buys 1.72x KV capacity.
+Only E4M3 is accepted; E5M2 is refused at init rather than at first request.
+
+## Vision tower
+
+Verified working under the full configuration (fp8 KV, prefix caching, MTP 3,
+engrams on disk). Two synthetic images with controlled content -- a red circle
+top-left plus a blue square bottom-right, and the digit 7 -- both answered
+correctly and with correct spatial relations
+(`fp8kv/vision_test_output.txt`). Synthetic rather than stock imagery so a
+correct answer cannot come from a prior.
+
 ## Other findings
 
 ### MTP 3 zero-acceptance -- also caused by the same bug, now fixed
@@ -143,7 +190,9 @@ tokens`, sustained: it drafted at ~380 tok/s and nothing was ever accepted.
 That was attributed here to the downstream fork's `4c1f7b2c3` *"fix(mtp):
 preserve position-zero embeddings (#539)"*. **That attribution is withdrawn.**
 
-With the mamba seeding fix, MTP 3 reports `Mean acceptance length: 3.00-3.13`.
+With the mamba seeding fix, MTP 3 reports a mean acceptance length of
+**2.65-3.13** across runs (`fp8kv/fp8_metrics.txt` captures 2.65-2.96 under
+load on the fp8-KV run).
 The corrupted mamba state was making every draft mismatch the target, so zero
 acceptance was a second symptom of the same defect.
 

@@ -1,0 +1,34 @@
+### Config
+  exec /workspace/vllmenv/bin/vllm serve /workspace/model \
+    --served-model-name q38fn \
+    --tensor-parallel-size 1 \
+    --max-model-len 180224 \
+    --max-num-seqs 16 \
+    --gpu-memory-utilization 0.95 \
+    --enable-prefix-caching \
+    --kv-cache-dtype fp8 \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
+    --port 8000
+
+### KV cache (fp8)
+INFO 09-02 04:50:50 [kv_cache_utils.py:2020] GPU KV cache size: 780,970 tokens, Maximum concurrency for 180,224 tokens per request: 4.33x
+
+### MTP speculative decoding acceptance
+SpecDecoding metrics: Mean acceptance length: 2.67, Accepted throughput: 98.57 tokens/s, Drafted throughput: 176.95 tokens/s, Accepted: 986
+SpecDecoding metrics: Mean acceptance length: 2.67, Accepted throughput: 80.58 tokens/s, Drafted throughput: 144.87 tokens/s, Accepted: 806
+SpecDecoding metrics: Mean acceptance length: 2.65, Accepted throughput: 31.80 tokens/s, Drafted throughput: 57.89 tokens/s, Accepted: 318
+SpecDecoding metrics: Mean acceptance length: 2.96, Accepted throughput: 0.38 tokens/s, Drafted throughput: 0.58 tokens/s, Accepted: 98
+
+### Host memory (engine process) - anon vs evictable file-backed
+Rss:            29980328 kB
+Pss:            29782507 kB
+Pss_Anon:        3180612 kB
+Pss_File:       26492511 kB
+Private_Clean:  26291836 kB
+Private_Dirty:   3309992 kB
+Anonymous:       3180612 kB
+  (safetensors mmap Rss within this process:)
+  24.77 GiB
+
+### Illegal memory accesses this run
+0

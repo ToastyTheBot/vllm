@@ -1658,12 +1658,28 @@ def _attach_table(
                 f"{rows} rows, expected {expected_rows}"
             )
 
+    if nvfp4:
+        # The weight shards were row-validated above; the block-scale shards are
+        # indexed by the SAME row ids, so a mismatched row count would either
+        # raise late or -- for an over-long shard -- silently serve misaligned
+        # scales for every row past the skew point. Fail closed.
+        for shard_index, (_p, _o, rows) in layer_shards.scale_shards.items():
+            checkpoint_start = shard_index * shard_size
+            expected_rows = max(0, min(shard_size, vocab - checkpoint_start))
+            if rows != expected_rows:
+                raise RuntimeError(
+                    f"PLE mmap: layer {layer_idx} NVFP4 block-scale shard "
+                    f"{shard_index} has {rows} rows, expected {expected_rows}"
+                )
     if embedding.table is not None:
         # Defensive: build_tables' own idempotency skip (table is not None
         # -> layer skipped) should make this unreachable in practice, but a
         # direct _attach_table re-entry must not leak the old ThreadPool.
         embedding.table.close()
         embedding.table = None
+        if embedding.scale_table is not None:
+            embedding.scale_table.close()
+            embedding.scale_table = None
 
     row_bytes = layer_shards.cols * _itemsize(layer_shards.dtype_str)
     table: MmapPleTable | None = None
@@ -1701,6 +1717,12 @@ def _attach_table(
             embedding.global_scale = _read_scale(
                 layer_shards.global_scale_entry
             ).reshape(()).to(torch.float32)
+            if scale_table.rows_total != table.rows_total:
+                raise RuntimeError(
+                    f"PLE mmap: layer {layer_idx} NVFP4 block-scale table has "
+                    f"{scale_table.rows_total} rows but the weight table has "
+                    f"{table.rows_total}"
+                )
             embedding.scale_table = scale_table
             # Dequantized output is bf16, so Qwen4ExpPLELayer's is_fp8() gate
             # correctly declines to apply a second scale to it.
