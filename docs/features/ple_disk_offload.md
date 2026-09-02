@@ -131,6 +131,29 @@ of weights does not fit in 96 GB of VRAM.
   weights are identical. `docker/ple-disk-entrypoint.sh` does this
   automatically.
 
+### Startup time: pick the NVFP4 MoE backend explicitly
+
+Left on `auto`, vLLM selects the `FLASHINFER_CUTLASS` NVFP4 MoE backend, which
+JIT-compiles `fused_moe_120` on first boot. Measured on one RTX PRO 6000
+Blackwell constrained to ~28 GiB of host memory:
+
+| `--moe-backend` | `init engine` | notes |
+|---|---|---|
+| auto (`FLASHINFER_CUTLASS`) | **1656.75 s** (27.6 min) | JIT builds a 152 MB kernel cache |
+| **`marlin`** | **82.27 s** | kernels ship compiled in the wheel; no JIT |
+| `b12x` | — | crashes: illegal memory access during cudagraph profiling |
+
+`--moe-backend marlin` is the recommendation: roughly 20x faster to start, and
+it removes the JIT step that is actively fatal on a small host (see
+`MAX_JOBS` above).
+
+Two caveats on the JIT path if you keep it. It must be able to persist its
+cache -- see `FLASHINFER_WORKSPACE_BASE` in the Dockerfile, since flashinfer
+ignores `XDG_CACHE_HOME` -- or every new container repays the full compile.
+And `b12x` is not currently an option for this model despite being built for
+sm120: `--linear-backend b12x` logs "has no kernel for this linear layer type"
+and falls back, while `--moe-backend b12x` (1.2.6) faults.
+
 ### sm120 (Blackwell) prerequisites
 
 - **CUDA >= 12.9.** flashinfer refuses to JIT any sm120 kernel below that

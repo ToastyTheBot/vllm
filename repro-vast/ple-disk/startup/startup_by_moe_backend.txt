@@ -1,0 +1,27 @@
+### Startup cost by NVFP4 MoE backend
+Host: RTX PRO 6000 Blackwell Workstation Edition 96GB, sm_120, driver 595.71.05
+Memory constrained to ~28 GiB via cgroup-sized balloon (memory.max 127.5 GiB)
+vLLM reported: Available RAM: 25.75 GiB  (production box reports 25.32 GiB)
+
+-- FLASHINFER_CUTLASS (auto-selected) --
+09-02 11:30:15 [nvfp4.py:304] Using 'FLASHINFER_CUTLASS' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLL
+09-02 11:31:38 [nvfp4.py:304] Using 'MARLIN' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHIN
+09-02 11:32:04 [model_runner.py:404] Model loading took 73.07 GiB memory and 111.485301 seconds
+09-02 11:32:36 [monitor.py:53] torch.compile took 18.37 s in total
+09-02 11:58:13 [monitor.py:53] torch.compile took 2.53 s in total
+09-02 11:58:29 [kv_cache_utils.py:2020] GPU KV cache size: 717,714 tokens, Maximum concurrency for 262,144 tokens per re
+09-02 11:59:41 [core.py:361] init engine (profile, create kv cache, warmup model) took 1656.75 s (compilation: 20.90 s)
+
+-- MARLIN (--moe-backend marlin) --
+09-02 12:05:47 [nvfp4.py:261] Using 'MARLIN' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHIN
+09-02 12:07:47 [model_runner.py:404] Model loading took 73.03 GiB memory and 119.617034 seconds
+09-02 12:08:11 [monitor.py:53] torch.compile took 17.15 s in total
+09-02 12:08:14 [monitor.py:53] torch.compile took 1.69 s in total
+09-02 12:08:20 [kv_cache_utils.py:2020] GPU KV cache size: 712,624 tokens, Maximum concurrency for 262,144 tokens per re
+09-02 12:09:09 [core.py:361] init engine (profile, create kv cache, warmup model) took 82.27 s (compilation: 18.84 s)
+
+-- B12X (--moe-backend b12x, b12x 1.2.6) --
+09-02 12:12:55 [__init__.py:349] --linear-backend=b12x has no kernel for this linear layer type; using automatic selecti
+09-02 12:12:56 [nvfp4.py:261] Using 'B12X' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHINFE
+(EngineCore pid=5518) ERROR 09-02 12:15:34 [core.py:1374] torch.AcceleratorError: CUDA error: an illegal memory access w
+(EngineCore pid=5518) ERROR 09-02 12:15:34 [core.py:1374] torch.AcceleratorError: CUDA error: an illegal memory access w
