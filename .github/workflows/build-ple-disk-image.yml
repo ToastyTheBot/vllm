@@ -1,0 +1,260 @@
+name: Build PLE disk-offload image
+
+# Builds the single image that serves Qwen3.8-Flash-Next-NVFP4 on one
+# RTX PRO 6000 96 GB with the n-gram ("engram") table streamed from NVMe.
+#
+# This is buildable on a CPU-only hosted runner only because every source
+# change on this branch is pure Python -- the CUDA extensions come from a
+# pinned precompiled wheel, so nothing here compiles CUDA.
+
+on:
+  push:
+    branches:
+      - feat/ple-disk-offload
+    paths:
+      - "docker/Dockerfile.ple-disk"
+      - "docker/ple-disk-entrypoint.sh"
+      - "vllm/**"
+      - "setup.py"
+      - "requirements/**"
+      - ".github/workflows/build-ple-disk-image.yml"
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: "Push to GHCR (uncheck to build only)"
+        type: boolean
+        default: true
+      version:
+        description: "Experiment number for the v<N> tag: 1, 2, 3 ... (omit to tag by sha only)"
+        type: string
+        required: false
+      make_latest:
+        description: "Also move :latest to this build (only for the most performant config)"
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # A hosted runner has ~14 GB free, and this image is far larger than
+      # that. Removing the preinstalled toolchains we do not use reclaims
+      # ~30 GB, which is the difference between this job working and dying
+      # with "no space left on device" partway through the pip install.
+      - name: Reclaim runner disk
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          echo "after:"; df -h / | tail -1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # setup.py derives the package version from git metadata; a shallow
+          # checkout without tags makes that fail.
+          fetch-depth: 0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # RUN --mount=type=cache in the Dockerfile is builder-local and does not
+      # survive between runs on ephemeral runners. This restores/persists it so
+      # the uv download cache carries over, which matters because the
+      # dependency layer pulls a ~4 GiB torch.
+      - name: Expose GHA cache to BuildKit
+        uses: crazy-max/ghaction-github-runtime@v3
+
+      - name: Log in to GHCR
+        # Skipped for build-only runs so the job still works without
+        # package-write access.
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Named vllm-openai to match upstream's published image
+      # (docker.io/vllm/vllm-openai): same owner/name shape, so the only
+      # difference from upstream is the registry and owner.
+      #
+      # The owner's casing is preserved by github.repository_owner but registry
+      # references must be lowercase. metadata-action lowercases the tags it
+      # generates; the cache refs below are raw strings and are not covered by
+      # that, so compute a lowercase name once and use it for both.
+      - name: Compute lowercase image name
+        id: img
+        env:
+          RAW_IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vllm-openai
+        run: echo "name=${RAW_IMAGE,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.name }}
+          # :latest is NOT moved by a plain branch push. It marks the
+          # best-measured configuration, so it only moves when a run is
+          # dispatched with make_latest -- otherwise a routine source push
+          # would silently retag the production image to an unmeasured build.
+          # Every build is still addressable by its immutable sha tag.
+          # Only the immutable sha tag is applied by the build itself. The
+          # human-facing tags (:latest, :v<N>) are attached AFTER the smoke
+          # test, by the "Promote tags" step below -- see the comment there.
+          tags: |
+            type=sha,format=long
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.ple-disk
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Registry cache rather than the local one: the layers are far too
+          # large to keep on the runner alongside the build itself. mode=max
+          # exports intermediate layers too, which is what lets a source-only
+          # change reuse the dependency and flashinfer-AOT layers instead of
+          # rebuilding ~4 GiB of torch and recompiling the MoE kernels.
+          cache-from: type=registry,ref=${{ steps.img.outputs.name }}:buildcache
+          cache-to: ${{ (github.event_name != 'workflow_dispatch' || inputs.push_image) && format('type=registry,ref={0}:buildcache,mode=max', steps.img.outputs.name) || '' }}
+          provenance: false
+
+      # A green build only proves the layers assembled. This asserts the
+      # image actually carries a CUDA torch and this branch's changes -- the
+      # failure mode being guarded against is a precompiled-wheel install that
+      # silently resolves to something other than what was validated.
+      - name: Smoke test the image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+        env:
+          IMAGE_REF: ${{ steps.img.outputs.name }}:sha-${{ github.sha }}
+        run: |
+          # -i is load-bearing: without it docker closes the container's
+          # stdin, `python -` reads EOF, executes nothing and exits 0 -- a
+          # smoke test that silently cannot fail. The sentinel grep below is
+          # the backstop for that whole class of mistake.
+          out=$(docker run --rm -i --entrypoint /opt/venv/bin/python \
+                  "$IMAGE_REF" - <<'PYEOF'
+          import torch
+          import vllm.envs as envs
+
+          # Import the model module first. qsa.py and model.py import each
+          # other, and the cycle only resolves in that order -- reaching for
+          # nvidia.qsa directly raises ImportError on a partially initialized
+          # module. This mirrors how vLLM itself loads the package.
+          import vllm.models.qwen4_exp.nvidia.model  # noqa: F401
+          from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
+          from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+          from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+              MambaHybridModelState,
+          )
+
+          print("torch", torch.__version__, "cuda", torch.version.cuda)
+          assert torch.version.cuda, "image has a CPU-only torch"
+
+          # PLE disk offload (NVFP4 support lives behind this flag).
+          assert hasattr(envs, "VLLM_PLE_MMAP"), "VLLM_PLE_MMAP missing"
+          assert qsa_ops._FP8_KV_DTYPES, "fp8 KV dtypes missing from ops.qsa"
+
+          # fp8 KV on the QSA path.
+          assert "fp8" in qsa_mod._QSA_SUPPORTED_KV_CACHE_DTYPES, "fp8 KV missing"
+          assert "fp8_e5m2" not in qsa_mod._QSA_SUPPORTED_KV_CACHE_DTYPES, (
+              "e5m2 must stay refused at init"
+          )
+
+          # The hybrid-mamba prefix-caching fix.
+          assert hasattr(MambaHybridModelState, "_mamba_align_block_size"), (
+              "mamba align block-size fix missing"
+          )
+          print("image carries: PLE mmap + NVFP4, fp8 KV on QSA, mamba fix")
+          print("IMAGE_CHECKS_PASSED")
+          PYEOF
+          )
+          echo "$out"
+          grep -q "IMAGE_CHECKS_PASSED" <<<"$out" || {
+            echo "::error::smoke test produced no sentinel -- it did not run"
+            exit 1
+          }
+
+      # Attach the human-facing tags only now, after the smoke test has passed.
+      #
+      # Previously :latest and :v<N> were applied by the build step, so a
+      # broken image was already published under the tag production pulls by
+      # the time the smoke test went red -- and a failed run retracts nothing.
+      # That is not hypothetical: a CPU-only-torch image was published exactly
+      # this way before 62a20b782b caught it.
+      #
+      # imagetools re-points tags at an existing manifest by digest, so this
+      # neither rebuilds nor re-uploads any layer -- the sha tag pushed above
+      # is the same image these names will resolve to.
+      - name: Promote tags after smoke test
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.push_image && (inputs.version != '' || inputs.make_latest) }}
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          SRC: ${{ steps.img.outputs.name }}:sha-${{ github.sha }}
+          VERSION: ${{ inputs.version }}
+          MAKE_LATEST: ${{ inputs.make_latest }}
+        run: |
+          set -euo pipefail
+          extra=""
+          if [ -n "$VERSION" ]; then
+            extra="$extra --tag ${IMAGE}:v${VERSION}"
+          fi
+          if [ "$MAKE_LATEST" = "true" ]; then
+            extra="$extra --tag ${IMAGE}:latest"
+          fi
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $extra "$SRC"
+          echo "promoted $SRC ->$extra"
+
+      - name: Summary
+        if: always()
+        # Interpolations go through env rather than straight into run:, per
+        # GitHub's workflow-injection guidance. Nothing here is
+        # event-controlled, but the habit is cheap.
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_REF: ${{ steps.img.outputs.name }}:latest
+        run: |
+          {
+            echo "### PLE disk-offload image"
+            echo
+            echo "Tags:"
+            echo '```'
+            echo "$IMAGE_TAGS"
+            echo '```'
+            echo
+            echo "Run it (single RTX PRO 6000 96 GB):"
+            echo '```bash'
+            echo "docker run --gpus all --ipc=host -p 8000:8000 \\"
+            echo "  -v /path/to/checkpoint:/model -v /path/to/nvme-cache:/cache \\"
+            echo "  $IMAGE_REF /model"
+            echo '```'
+            echo
+            echo "Named vllm-openai to match upstream, but not a drop-in"
+            echo "replacement: the model path is the first positional argument,"
+            echo "and the entrypoint forces the PIECEWISE cudagraph mode the"
+            echo "disk-backed PLE gather requires. Later args pass through to"
+            echo "vllm serve."
+            echo
+            echo "The checkpoint volume is mounted read-write on purpose: the"
+            echo "entrypoint rewrites config.json from the downstream"
+            echo "qwen3_8_flash_next naming to upstream's qwen4_exp, keeping the"
+            echo "original alongside as config.json.orig."
+            echo
+            echo "Disk after build:"
+            echo '```'
+            df -h / | tail -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

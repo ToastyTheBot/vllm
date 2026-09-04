@@ -1,0 +1,171 @@
+# Serve Qwen3.8-Flash-Next NVFP4 on ONE RTX PRO 6000 96 GB with the n-gram
+# ("engram") table streamed from disk, so host RAM stays small.
+#
+# Build:
+#   docker build -f docker/Dockerfile.ple-disk -t vllm-openai .
+#
+# Named vllm-openai to match upstream's published image, but it is NOT a
+# drop-in replacement: the entrypoint takes the model path as its first
+# positional argument, rewrites the checkpoint's config.json to upstream's
+# qwen4_exp naming, and forces the PIECEWISE cudagraph mode the disk-backed
+# PLE gather requires. Everything after the model path is passed through to
+# `vllm serve`.
+#
+# Run (see docs/features/ple_disk_offload.md for the full recipe):
+#   docker run --gpus all --ipc=host -p 8000:8000 \
+#     -v /path/to/checkpoint:/model -v /path/to/nvme-cache:/cache \
+#     vllm-openai /model
+#
+# The checkpoint mount is READ-WRITE, not :ro. A checkpoint whose config.json
+# still says model_type=qwen3_8_flash_next is rewritten in place by the
+# entrypoint to upstream's qwen4_exp naming; under :ro that write raises and
+# `set -euo pipefail` kills the container at startup. This file previously
+# documented :ro while the entrypoint wrote to the mount -- the two
+# instructions contradicted each other and the documented one failed for
+# exactly the checkpoint the remap exists to serve.
+#
+# To use :ro, serve a pre-remapped checkpoint, e.g.
+#   huggingface.co/huginnfork/Qwen3.8-Flash-Next-NVFP4-qwen4exp
+# which is byte-identical weights with only the four config.json naming values
+# changed. The entrypoint's rewrite is a no-op there, so :ro is safe.
+#
+# Why each pin below is here — every one of these was a real failure:
+#
+#   * CUDA >= 12.9. flashinfer's _normalize_cuda_arch() raises
+#     "SM 12.x requires CUDA >= 12.9" on Blackwell, so a CUDA 12.8 base cannot
+#     JIT any sm120 kernel. 13.0 also matches torch's cu130 build.
+#   * libcurand-dev. The sm120 MXFP8 GEMM JIT pulls in CUTLASS's
+#     tensor_fill.h, which includes curand_kernel.h. Without it the ninja
+#     build fails after the model has already loaded (~80 s wasted per try).
+#   * VLLM_DISABLED_KERNELS. flashinfer's cutlass mm_mxfp8 rejects this
+#     model's projection shapes with "Problem size is not supported for
+#     mm_mxfp8"; disabling it falls through to Marlin, which works.
+#   * cudagraph_mode=PIECEWISE. The PLE gather is a blocking host round-trip
+#     and cannot run inside a capture; ple_mmap refuses FULL at startup.
+
+#
+# LAYER ORDER IS LOAD-BEARING. Everything expensive and source-independent
+# (torch and the pinned vLLM wheel) happens BEFORE `COPY . .`
+# so that editing a Python file in this repo does not invalidate a ~4 GiB
+# dependency install and a multi-minute kernel build. Only the last two layers
+# rebuild on a source change.
+
+ARG BASE_IMAGE=nvidia/cuda:13.0.1-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+        python3 python3-venv python3-dev git curl ca-certificates build-essential ninja-build \
+        libcurand-dev-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:/opt/venv/bin:$PATH
+ENV VIRTUAL_ENV=/opt/venv
+
+# sm_120 (RTX PRO 6000 Blackwell). 12.0f is flashinfer's family target for
+# SM120; 12.0a is what torch wants for its own extensions.
+ENV FLASHINFER_CUDA_ARCH_LIST=12.0f
+ENV TORCH_CUDA_ARCH_LIST=12.0a
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN uv venv --python 3.12 /opt/venv
+
+# --- dependency layer: no repo source, so it survives every source edit -----
+#
+# The wheel is pinned explicitly rather than auto-detected. setup.py otherwise
+# calls detect_system_cuda_variant(), which needs nvidia-smi or an installed
+# torch to pick a CUDA variant -- neither exists on a GPU-less build host, and
+# the failure mode is a confusing metadata-fetch error rather than a clear one.
+# This URL is the wheel for the branch's base commit (39e276eae), which is the
+# build these Python changes were developed and validated against.
+#
+# --torch-backend must be pinned, NOT left at auto. uv's auto detection probes
+# for a GPU/driver; a CPU-only build host has neither, so it silently resolves
+# a CPU-only torch. The build still succeeds and the image still pushes -- it
+# just cannot serve.
+ARG VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/39e276eaeb9daed06a180f6a8d187bbb8790e97b/vllm-0.28.1rc1.dev164%2Bg39e276eae-cp38-abi3-manylinux_2_28_x86_64.whl
+ARG TORCH_BACKEND=cu130
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv pip install "${VLLM_PRECOMPILED_WHEEL_LOCATION}" --torch-backend=${TORCH_BACKEND}
+
+# --- flashinfer JIT: bound its build parallelism ---------------------------
+#
+# On the first boot flashinfer JIT-compiles fused_moe_120 on the serving host.
+# With MAX_JOBS unset, flashinfer's _get_num_workers() returns None, so no -j
+# reaches ninja and it defaults to nproc+2 concurrent nvcc jobs. At 1-3 GiB per
+# CUTLASS translation unit that is fatal on a small host: the OOM killer takes
+# the build and EngineCore dies with
+#
+#     Command '[ninja ... cached_ops/fused_moe_120 ...]' returned non-zero
+#     exit status 137          (137 = 128 + SIGKILL)
+#
+# observed on a 28 GiB / 16-core host. Capping it trades a slower one-time
+# compile for a build that survives; results land in /cache (mounted), so only
+# a cold cache pays it. Raise on a large host.
+#
+# NOT precompiled at image build time, though that would be better. Two things
+# block it with this flashinfer version:
+#   * flashinfer.aot needs the csrc/*.jinja templates, which the runtime wheel
+#     does not ship -- it fails with FileNotFoundError on
+#     batch_prefill_customize_config.jinja. AOT needs the source distribution.
+#   * the prebuilt flashinfer-jit-cache wheels only go up to 0.6.9rc1, and the
+#     cache is version-keyed (.../flashinfer/<version>/120f/...), so a 0.6.9
+#     cache is simply not consulted by the 0.6.18 runtime here.
+# Worth revisiting when a matching jit-cache wheel exists.
+ENV MAX_JOBS=2
+ENV NVCC_THREADS=2
+
+# --- source layer: everything below rebuilds on a source change ------------
+WORKDIR /workspace/vllm
+# setup.py derives a version from git metadata, so .git must be present.
+COPY . .
+
+# --no-deps: the dependency layer above already resolved and installed
+# everything, and re-resolving here would defeat its caching. This swaps the
+# wheel-installed vllm for the editable source tree so this branch's Python
+# changes are the ones that run.
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    VLLM_USE_PRECOMPILED=1 uv pip install -e . --no-deps
+
+# Keep JIT caches on a mounted volume so the flashinfer build and the
+# torch.compile artifacts survive container restarts.
+#
+# FLASHINFER_WORKSPACE_BASE is load-bearing and easy to miss: flashinfer does
+# NOT honour XDG_CACHE_HOME. jit/env.py computes its cache as
+#   FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+# where FLASHINFER_BASE_DIR = os.getenv("FLASHINFER_WORKSPACE_BASE", HOME).
+# Without it the fused_moe_120 build lands in /root/.cache/flashinfer, which is
+# in the container's writable layer and is therefore thrown away on every
+# `docker run` -- paying the full ~20 minute compile on each new container.
+ENV XDG_CACHE_HOME=/cache
+ENV VLLM_CACHE_ROOT=/cache/vllm
+ENV TRITON_CACHE_DIR=/cache/triton
+ENV FLASHINFER_WORKSPACE_BASE=/cache
+
+# Serve the n-gram table from disk rather than GPU/host memory.
+ENV VLLM_PLE_MMAP=1
+ENV VLLM_PLE_MMAP_WORKERS=32
+ENV VLLM_PLE_MMAP_CHUNK=2048
+
+# Run the gather on the calling thread for any batch touching <= 4096 distinct
+# rows, which is every decode batch this model produces (~800 rows at
+# concurrency 6). This is a THRESHOLD, not a boolean: ple_mmap.py gates on
+# `uniq.size <= self.serial`, so the value must exceed the batch's distinct-row
+# count or the knob silently does nothing.
+#
+# Measured on one RTX PRO 6000 Blackwell WS, estonia c=6, MTP 3, fp8 KV:
+#   gather p50   11.27 ms -> 1.71 ms   (6.6x)
+#   decode p50   62.68    -> 78.70 tok/s   (+25.6%)
+# The 32-worker pool was the cost: a decode gather scatters a few hundred rows
+# across all 128 shards, so it degenerated to roughly one pool task per row and
+# dispatch dominated the copy.
+ENV VLLM_PLE_MMAP_SERIAL=4096
+
+# flashinfer's cutlass mm_mxfp8 cannot do this model's problem sizes on sm120.
+ENV VLLM_DISABLED_KERNELS=FlashInferCutlassMxfp8LinearKernel
+
+EXPOSE 8000
+COPY docker/ple-disk-entrypoint.sh /usr/local/bin/ple-disk-entrypoint.sh
+RUN chmod +x /usr/local/bin/ple-disk-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/ple-disk-entrypoint.sh"]
