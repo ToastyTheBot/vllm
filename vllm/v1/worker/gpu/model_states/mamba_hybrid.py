@@ -119,8 +119,48 @@ class MambaHybridModelState(DefaultModelState):
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1)
+                // self._mamba_align_block_size()
             )
+
+    def _mamba_align_block_size(self) -> int:
+        """Block size of the MAMBA group's block table.
+
+        Deliberately NOT ``cache_config.block_size``. EngineCore rewrites that
+        field to ``min(g.kv_cache_spec.block_size for g in kv_cache_groups)``
+        once the KV cache config is known (``vllm/v1/engine/core.py``), so on a
+        hybrid model it becomes the SMALLEST group's block size, which is not
+        the mamba group's. On Qwen3.8-Flash-Next it lands on the PLE
+        short-conv group's 4 against a mamba block size of 1568, so seeding the
+        state column with it overshoots by 392x; the pre-copy kernel then reads
+        past its block-table row, picks up a garbage block id, multiplies it by
+        the state stride and faults. ``num_computed_tokens == 0`` yields -1 for
+        any positive divisor, which is why only prefix-cache hits ever crashed.
+
+        ``cache_config.mamba_block_size`` is the safe fallback for the window
+        before the spec is resolved (``add_request`` can run before the first
+        ``preprocess_state``). Note it *is* written during config resolution --
+        ``platforms/interface.py`` sets it in align mode and ``models/config.py``
+        supplies a default -- but both happen before workers start and land on
+        exactly the value ``MambaSpec.block_size`` is later copied from, so the
+        fallback agrees with the spec. What must never be used is
+        ``cache_config.block_size``, which EngineCore repurposes after that
+        point.
+        """
+        spec = self._mamba_spec
+        if spec is not None:
+            return spec.block_size
+        block_size = self.cache_config.mamba_block_size
+        if not block_size:
+            raise RuntimeError(
+                "mamba align mode needs the mamba block size to seed the "
+                "running state column, but the mamba spec is not resolved yet "
+                "and cache_config.mamba_block_size is unset. Refusing to fall "
+                "back to cache_config.block_size, which is the smallest KV "
+                "group's block size on hybrid models and silently corrupts "
+                "the state block table."
+            )
+        return block_size
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
